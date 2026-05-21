@@ -38,6 +38,9 @@ const (
 	CmdGetData      = "getdata"
 	CmdNotFound     = "notfound"
 	CmdBlock        = "block"
+	CmdCmpctBlock   = "cmpctblock"
+	CmdGetBlockTxn  = "getblocktxn"
+	CmdBlockTxn     = "blocktxn"
 	CmdTx           = "tx"
 	CmdGetHeaders   = "getheaders"
 	CmdHeaders      = "headers"
@@ -49,6 +52,7 @@ const (
 	CmdFilterLoad   = "filterload"
 	CmdMerkleBlock  = "merkleblock"
 	CmdReject       = "reject"
+	CmdSendCmpct    = "sendcmpct"
 	CmdSendHeaders  = "sendheaders"
 	CmdFeeFilter    = "feefilter"
 	CmdGetCFilters  = "getcfilters"
@@ -65,11 +69,14 @@ var (
 	v2MessageIDs = map[uint8]string{
 		1:  CmdAddr,
 		2:  CmdBlock,
+		3:  CmdBlockTxn,
+		4:  CmdCmpctBlock,
 		5:  CmdFeeFilter,
 		6:  CmdFilterAdd,
 		7:  CmdFilterClear,
 		8:  CmdFilterLoad,
 		9:  CmdGetBlocks,
+		10: CmdGetBlockTxn,
 		11: CmdGetData,
 		12: CmdGetHeaders,
 		13: CmdHeaders,
@@ -79,6 +86,7 @@ var (
 		17: CmdNotFound,
 		18: CmdPing,
 		19: CmdPong,
+		20: CmdSendCmpct,
 		21: CmdTx,
 		22: CmdGetCFilters,
 		23: CmdCFilter,
@@ -92,11 +100,14 @@ var (
 	v2Messages = map[string]uint8{
 		CmdAddr:         1,
 		CmdBlock:        2,
+		CmdBlockTxn:     3,
+		CmdCmpctBlock:   4,
 		CmdFeeFilter:    5,
 		CmdFilterAdd:    6,
 		CmdFilterClear:  7,
 		CmdFilterLoad:   8,
 		CmdGetBlocks:    9,
+		CmdGetBlockTxn:  10,
 		CmdGetData:      11,
 		CmdGetHeaders:   12,
 		CmdHeaders:      13,
@@ -106,6 +117,7 @@ var (
 		CmdNotFound:     17,
 		CmdPing:         18,
 		CmdPong:         19,
+		CmdSendCmpct:    20,
 		CmdTx:           21,
 		CmdGetCFilters:  22,
 		CmdCFilter:      23,
@@ -182,6 +194,15 @@ func makeEmptyMessage(command string) (Message, error) {
 	case CmdBlock:
 		msg = &MsgBlock{}
 
+	case CmdCmpctBlock:
+		msg = &MsgCmpctBlock{}
+
+	case CmdGetBlockTxn:
+		msg = &MsgGetBlockTxn{}
+
+	case CmdBlockTxn:
+		msg = &MsgBlockTxn{}
+
 	case CmdInv:
 		msg = &MsgInv{}
 
@@ -226,6 +247,9 @@ func makeEmptyMessage(command string) (Message, error) {
 
 	case CmdSendHeaders:
 		msg = &MsgSendHeaders{}
+
+	case CmdSendCmpct:
+		msg = &MsgSendCmpct{}
 
 	case CmdFeeFilter:
 		msg = &MsgFeeFilter{}
