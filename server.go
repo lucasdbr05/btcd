@@ -539,6 +539,14 @@ func (sp *serverPeer) OnVersion(_ *peer.Peer, msg *wire.MsgVersion) *wire.MsgRej
 // to kick start communication with them.
 func (sp *serverPeer) OnVerAck(_ *peer.Peer, _ *wire.MsgVerAck) {
 	sp.server.AddPeer(sp)
+
+	if sp.ProtocolVersion() >= wire.ShortIdsBlocksVersion {
+		var compactBlockVersion uint64 = 1
+		if sp.IsWitnessEnabled() {
+			compactBlockVersion = 2
+		}
+		sp.PushSendCmpctMsg(false, compactBlockVersion)
+	}
 }
 
 // OnMemPool is invoked when a peer receives a mempool bitcoin message.
@@ -642,6 +650,76 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte) {
 	// the bitcoin block has been fully processed.
 	sp.server.syncManager.QueueBlock(block, sp.Peer, sp.blockProcessed)
 	<-sp.blockProcessed
+}
+
+// OnCmpctBlock is invoked when a peer receives a cmpctblock bitcoin message.
+func (sp *serverPeer) OnCmpctBlock(_ *peer.Peer, msg *wire.MsgCmpctBlock) {
+	sp.server.syncManager.QueueCmpctBlock(msg, sp.Peer)
+}
+
+// OnSendCmpct is invoked when a peer receives a sendcmpct bitcoin message.
+func (sp *serverPeer) OnSendCmpct(_ *peer.Peer, msg *wire.MsgSendCmpct) {
+	peerLog.Tracef("Peer %v negotiated compact blocks version %d (announce=%v)", sp, msg.Version, msg.Announce)
+}
+
+// OnBlockTxn is invoked when a peer receives a blocktxn bitcoin message.
+func (sp *serverPeer) OnBlockTxn(_ *peer.Peer, msg *wire.MsgBlockTxn) {
+	sp.server.syncManager.QueueBlockTxn(msg, sp.Peer)
+}
+
+// OnGetBlockTxn is invoked when a peer receives a getblocktxn bitcoin message.
+func (sp *serverPeer) OnGetBlockTxn(_ *peer.Peer, msg *wire.MsgGetBlockTxn) {
+	resp := wire.NewMsgBlockTxn(&msg.BlockHash)
+
+	var msgBlock wire.MsgBlock
+	err := sp.server.db.View(func(dbTx database.Tx) error {
+		blockBytes, err := dbTx.FetchBlock(&msg.BlockHash)
+		if err != nil {
+			return err
+		}
+
+		return msgBlock.Deserialize(bytes.NewReader(blockBytes))
+	})
+	if err != nil {
+		peerLog.Tracef("Unable to fetch getblocktxn block hash %v: %v",
+			msg.BlockHash, err)
+		return
+	}
+
+	lastIndex := uint32(0)
+	for i, index := range msg.Indexes {
+		if int(index) >= len(msgBlock.Transactions) {
+			peerLog.Debugf(
+				"Peer %v requested getblocktxn index %d outside block %v transaction count %d", sp, index,
+				msg.BlockHash,
+				len(msgBlock.Transactions),
+			)
+			return
+		}
+		if i > 0 && index <= lastIndex {
+			peerLog.Debugf(
+				"Peer %v sent non-increasing getblocktxn index %d after %d",
+				sp,
+				index,
+				lastIndex,
+			)
+			return
+		}
+		lastIndex = index
+
+		if err := resp.AddTransaction(msgBlock.Transactions[index]); err != nil {
+			peerLog.Debugf(
+				"Unable to add getblocktxn transaction %d for block %v: %v",
+				index,
+				msg.BlockHash,
+				err,
+			)
+			return
+		}
+	}
+
+	encoding := compactBlockEncoding(sp)
+	sp.QueueMessageWithEncoding(resp, nil, encoding)
 }
 
 // OnInv is invoked when a peer receives an inv bitcoin message and is
@@ -804,6 +882,11 @@ func (s *server) pushInventory(sp *serverPeer, iv *wire.InvVect,
 
 	case wire.InvTypeBlock:
 		return s.pushBlockMsg(sp, &iv.Hash, doneChan, wire.BaseEncoding)
+
+	case wire.InvTypeCompactBlock:
+		return s.pushCompactBlockMsg(
+			sp, &iv.Hash, doneChan, compactBlockEncoding(sp),
+		)
 
 	case wire.InvTypeFilteredWitnessBlock:
 		return s.pushMerkleBlockMsg(
@@ -1676,6 +1759,76 @@ func (s *server) pushBlockMsg(sp *serverPeer, hash *chainhash.Hash,
 	return nil
 }
 
+func compactBlockEncoding(sp *serverPeer) wire.MessageEncoding {
+	if sp.CompactBlockVersion() == 2 || (sp.CompactBlockVersion() == 0 && sp.IsWitnessEnabled()) {
+
+		return wire.WitnessEncoding
+	}
+
+	return wire.BaseEncoding
+}
+
+// pushCompactBlockMsg sends a cmpctblock message for the provided block hash
+// to the connected peer.  An error is returned if the block hash is not known.
+func (s *server) pushCompactBlockMsg(sp *serverPeer, hash *chainhash.Hash,
+	doneChan chan<- struct{}, encoding wire.MessageEncoding) error {
+
+	// Fetch the raw block bytes from the database.
+	var blockBytes []byte
+	err := sp.server.db.View(func(dbTx database.Tx) error {
+		var err error
+		blockBytes, err = dbTx.FetchBlock(hash)
+		return err
+	})
+	if err != nil {
+		peerLog.Tracef("Unable to fetch requested compact block hash "+
+			"%v: %v", hash, err)
+
+		if doneChan != nil {
+			doneChan <- struct{}{}
+		}
+		return err
+	}
+
+	block, err := btcutil.NewBlockFromBytes(blockBytes)
+	if err != nil {
+		peerLog.Tracef("Unable to deserialize requested compact block "+
+			"hash %v: %v", hash, err)
+
+		if doneChan != nil {
+			doneChan <- struct{}{}
+		}
+		return err
+	}
+
+	nonce, err := wire.RandomUint64()
+	if err != nil {
+		peerLog.Tracef("Unable to generate compact block nonce for "+
+			"%v: %v", hash, err)
+
+		if doneChan != nil {
+			doneChan <- struct{}{}
+		}
+		return err
+	}
+
+	cmpctBlock, err := netsync.BuildCompactBlock(
+		block, nonce, nil, encoding == wire.WitnessEncoding,
+	)
+	if err != nil {
+		peerLog.Tracef("Unable to build compact block %v: %v", hash, err)
+
+		if doneChan != nil {
+			doneChan <- struct{}{}
+		}
+		return err
+	}
+
+	sp.QueueMessageWithEncoding(cmpctBlock, doneChan, encoding)
+	sp.AddKnownInventory(wire.NewInvVect(wire.InvTypeBlock, hash))
+	return nil
+}
+
 // pushMerkleBlockMsg sends a merkleblock message for the provided block hash to
 // the connected peer.  Since a merkle block requires the peer to have a filter
 // loaded, this call will simply be ignored if there is no filter loaded.  An
@@ -1933,6 +2086,21 @@ func (s *server) handleRelayInvMsg(state *peerState, msg relayMsg) {
 			return
 		}
 
+		if msg.invVect.Type == wire.InvTypeBlock && sp.WantsCmpctBlockAnnouncements() {
+
+			if sp.HasKnownInventory(msg.invVect) {
+				return
+			}
+
+			err := s.pushCompactBlockMsg(
+				sp, &msg.invVect.Hash, nil, compactBlockEncoding(sp),
+			)
+			if err != nil {
+				peerLog.Debugf("Unable to relay compact block %v to %v: %v", msg.invVect.Hash, sp, err)
+			}
+			return
+		}
+
 		// If the inventory is a block and the peer prefers headers,
 		// generate and send a headers message instead of an inventory
 		// message.
@@ -2187,9 +2355,12 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 			OnMemPool:      sp.OnMemPool,
 			OnTx:           sp.OnTx,
 			OnBlock:        sp.OnBlock,
+			OnCmpctBlock:   sp.OnCmpctBlock,
 			OnInv:          sp.OnInv,
 			OnHeaders:      sp.OnHeaders,
 			OnGetData:      sp.OnGetData,
+			OnGetBlockTxn:  sp.OnGetBlockTxn,
+			OnBlockTxn:     sp.OnBlockTxn,
 			OnGetBlocks:    sp.OnGetBlocks,
 			OnGetHeaders:   sp.OnGetHeaders,
 			OnGetCFilters:  sp.OnGetCFilters,
@@ -2202,6 +2373,7 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 			OnGetAddr:      sp.OnGetAddr,
 			OnAddr:         sp.OnAddr,
 			OnAddrV2:       sp.OnAddrV2,
+			OnSendCmpct:    sp.OnSendCmpct,
 			OnRead:         sp.OnRead,
 			OnWrite:        sp.OnWrite,
 			OnNotFound:     sp.OnNotFound,
