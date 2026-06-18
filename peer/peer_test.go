@@ -379,6 +379,9 @@ func TestPeerListeners(t *testing.T) {
 			OnBlock: func(p *peer.Peer, msg *wire.MsgBlock, buf []byte) {
 				ok <- msg
 			},
+			OnCmpctBlock: func(p *peer.Peer, msg *wire.MsgCmpctBlock) {
+				ok <- msg
+			},
 			OnInv: func(p *peer.Peer, msg *wire.MsgInv) {
 				ok <- msg
 			},
@@ -389,6 +392,12 @@ func TestPeerListeners(t *testing.T) {
 				ok <- msg
 			},
 			OnGetData: func(p *peer.Peer, msg *wire.MsgGetData) {
+				ok <- msg
+			},
+			OnGetBlockTxn: func(p *peer.Peer, msg *wire.MsgGetBlockTxn) {
+				ok <- msg
+			},
+			OnBlockTxn: func(p *peer.Peer, msg *wire.MsgBlockTxn) {
 				ok <- msg
 			},
 			OnGetBlocks: func(p *peer.Peer, msg *wire.MsgGetBlocks) {
@@ -438,6 +447,9 @@ func TestPeerListeners(t *testing.T) {
 				ok <- msg
 			},
 			OnSendHeaders: func(p *peer.Peer, msg *wire.MsgSendHeaders) {
+				ok <- msg
+			},
+			OnSendCmpct: func(p *peer.Peer, msg *wire.MsgSendCmpct) {
 				ok <- msg
 			},
 			OnSendAddrV2: func(p *peer.Peer, msg *wire.MsgSendAddrV2) {
@@ -517,6 +529,11 @@ func TestPeerListeners(t *testing.T) {
 				&chainhash.Hash{}, &chainhash.Hash{}, 1, 1)),
 		},
 		{
+			"OnCmpctBlock",
+			wire.NewMsgCmpctBlock(wire.NewBlockHeader(1,
+				&chainhash.Hash{}, &chainhash.Hash{}, 1, 1), 0),
+		},
+		{
 			"OnInv",
 			wire.NewMsgInv(),
 		},
@@ -531,6 +548,14 @@ func TestPeerListeners(t *testing.T) {
 		{
 			"OnGetData",
 			wire.NewMsgGetData(),
+		},
+		{
+			"OnGetBlockTxn",
+			wire.NewMsgGetBlockTxn(&chainhash.Hash{}),
+		},
+		{
+			"OnBlockTxn",
+			wire.NewMsgBlockTxn(&chainhash.Hash{}),
 		},
 		{
 			"OnGetBlocks",
@@ -591,6 +616,10 @@ func TestPeerListeners(t *testing.T) {
 		{
 			"OnSendHeaders",
 			wire.NewMsgSendHeaders(),
+		},
+		{
+			"OnSendCmpct",
+			wire.NewMsgSendCmpct(false, 1),
 		},
 		{
 			"OnSendAddrV2",
