@@ -59,6 +59,11 @@ const (
 	CmdCFCheckpt    = "cfcheckpt"
 	CmdSendAddrV2   = "sendaddrv2"
 	CmdWTxIdRelay   = "wtxidrelay"
+	CmdSendFountain = "sendftn"      
+	CmdGetFtnEpochs = "getftnepochs" 
+	CmdFtnEpochs    = "ftnepochs"    
+	CmdGetDroplets  = "getdroplets"  
+	CmdDroplets     = "droplets"     
 )
 
 var (
@@ -87,6 +92,11 @@ var (
 		26: CmdGetCFCheckpt,
 		27: CmdCFCheckpt,
 		28: CmdAddrV2,
+		29: CmdSendFountain,
+		30: CmdGetFtnEpochs,
+		31: CmdFtnEpochs,
+		32: CmdGetDroplets,
+		33: CmdDroplets,
 	}
 
 	v2Messages = map[string]uint8{
@@ -114,6 +124,11 @@ var (
 		CmdGetCFCheckpt: 26,
 		CmdCFCheckpt:    27,
 		CmdAddrV2:       28,
+		CmdSendFountain: 29,
+		CmdGetFtnEpochs: 30,
+		CmdFtnEpochs:    31,
+		CmdGetDroplets:  32,
+		CmdDroplets:     33,
 	}
 )
 
@@ -247,6 +262,21 @@ func makeEmptyMessage(command string) (Message, error) {
 
 	case CmdCFCheckpt:
 		msg = &MsgCFCheckpt{}
+
+	case CmdSendFountain:
+		msg = &MsgSendFountain{}
+
+	case CmdGetFtnEpochs:
+		msg = &MsgGetFtnEpochs{}
+
+	case CmdFtnEpochs:
+		msg = &MsgFtnEpochs{}
+
+	case CmdGetDroplets:
+		msg = &MsgGetDroplets{}
+
+	case CmdDroplets:
+		msg = &MsgDroplets{}
 
 	default:
 		return nil, ErrUnknownMessage
