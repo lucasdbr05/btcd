@@ -31,6 +31,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/connmgr"
 	"github.com/btcsuite/btcd/database"
+	"github.com/btcsuite/btcd/fountain/fountainmanager"
 	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/mining"
 	"github.com/btcsuite/btcd/mining/cpuminer"
@@ -45,7 +46,8 @@ const (
 	// defaultServices describes the default services that are supported by
 	// the server.
 	defaultServices = wire.SFNodeNetwork | wire.SFNodeNetworkLimited |
-		wire.SFNodeBloom | wire.SFNodeWitness | wire.SFNodeCF | wire.SFNodeP2PV2
+		wire.SFNodeBloom | wire.SFNodeWitness | wire.SFNodeCF |
+		wire.SFNodeP2PV2 | wire.SFNodeFountain
 
 	// defaultRequiredServices describes the default services that are
 	// required to be supported by outbound peers.
@@ -231,6 +233,7 @@ type server struct {
 	db                   database.DB
 	timeSource           blockchain.MedianTimeSource
 	services             wire.ServiceFlag
+	fountainManager      *manager.Manager
 
 	// The following fields are used for optional indexes.  They will be nil
 	// if the associated index is not enabled.  These fields are set during
@@ -1460,6 +1463,82 @@ func (sp *serverPeer) OnAddrV2(_ *peer.Peer, msg *wire.MsgAddrV2) {
 	sp.server.addrManager.AddAddresses(msg.AddrList, sp.NA())
 }
 
+func (s *server) handleFountainBlockchainNotification(notification *blockchain.Notification) {
+	if notification.Type != blockchain.NTBlockConnected {
+		return
+	}
+
+	block, ok := notification.Data.(*btcutil.Block)
+	if !ok {
+		srvrLog.Warnf("Fountain block connected notification is not a block")
+		return
+	}
+
+	epoch, completed, err := s.fountainManager.ProcessBlock(block)
+	if err != nil {
+		srvrLog.Warnf("Unable to process block %s for fountain epoch: %v",
+			block.Hash(), err)
+		return
+	}
+	if completed {
+		srvrLog.Infof("Generated %d fountain droplets for epoch %d",
+			epoch.NumDroplets, epoch.EpochID)
+	}
+}
+
+func (sp *serverPeer) OnSendFountain(_ *peer.Peer, msg *wire.MsgSendFountain) {
+	srvrLog.Debugf("Peer %s negotiated fountain sub-protocol v%d", sp.Addr(), msg.Version)
+	sp.QueueMessage(wire.NewMsgGetFtnEpochs(), nil)
+}
+
+func (sp *serverPeer) OnGetFtnEpochs(_ *peer.Peer, msg *wire.MsgGetFtnEpochs) {
+	_ = msg
+
+	sp.QueueMessage(sp.server.fountainManager.FtnEpochsMessage(), nil)
+}
+
+func (sp *serverPeer) OnFtnEpochs(_ *peer.Peer, msg *wire.MsgFtnEpochs) {
+	registered := 0
+	for _, epoch := range msg.Epochs {
+		if epoch == nil {
+			continue
+		}
+		if err := sp.server.fountainManager.RegisterEpoch(*epoch); err != nil {
+			srvrLog.Debugf("Unable to register fountain epoch %d from peer %s: %v", epoch.EpochID, sp.Addr(), err)
+			continue
+		}
+		registered++
+	}
+
+	srvrLog.Debugf("Registered %d fountain epochs from peer %s",
+		registered, sp.Addr())
+}
+
+func (sp *serverPeer) OnGetDroplets(_ *peer.Peer, msg *wire.MsgGetDroplets) {
+	for i := uint64(0); i < msg.Count; i++ {
+		dropletsMsg, err := sp.server.fountainManager.DropletsMessage(
+			msg.EpochID, msg.StartID+i, 1,
+		)
+		if err != nil {
+			srvrLog.Debugf("Unable to serve fountain droplet to peer %s for epoch %d at droplet %d: %v",
+				sp.Addr(), msg.EpochID, msg.StartID+i, err)
+			return
+		}
+		sp.QueueMessage(dropletsMsg, nil)
+	}
+}
+
+func (sp *serverPeer) OnDroplets(_ *peer.Peer, msg *wire.MsgDroplets) {
+	if err := sp.server.fountainManager.PutDroplets(
+		msg.EpochID, msg.Droplets,
+	); err != nil {
+		srvrLog.Debugf("Unable to store fountain droplets from peer %s for epoch %d: %v", sp.Addr(), msg.EpochID, err)
+		return
+	}
+
+	srvrLog.Debugf("Stored %d fountain droplets from peer %s for epoch %d", len(msg.Droplets), sp.Addr(), msg.EpochID)
+}
+
 // OnRead is invoked when a peer receives a message and it is used to update
 // the bytes received by the server.
 func (sp *serverPeer) OnRead(_ *peer.Peer, bytesRead int, msg wire.Message, err error) {
@@ -2205,6 +2284,11 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 			OnRead:         sp.OnRead,
 			OnWrite:        sp.OnWrite,
 			OnNotFound:     sp.OnNotFound,
+			OnSendFountain: sp.OnSendFountain,
+			OnGetFtnEpochs: sp.OnGetFtnEpochs,
+			OnFtnEpochs:    sp.OnFtnEpochs,
+			OnGetDroplets:  sp.OnGetDroplets,
+			OnDroplets:     sp.OnDroplets,
 		},
 		NewestBlock:         sp.newestBlock,
 		HostToNetAddress:    sp.server.addrManager.HostToNetAddress,
@@ -2844,6 +2928,11 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		srvrLog.Infof("User-agent whitelist %s", agentWhitelist)
 	}
 
+	fountainManager, err := manager.NewPersistent(db, manager.DefaultConfig())
+	if err != nil {
+		return nil, err
+	}
+
 	s := server{
 		chainParams:          chainParams,
 		addrManager:          amgr,
@@ -2860,6 +2949,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		db:                   db,
 		timeSource:           blockchain.NewMedianTime(),
 		services:             services,
+		fountainManager:      fountainManager,
 		sigCache:             txscript.NewSigCache(cfg.SigCacheMaxSize),
 		hashCache:            txscript.NewHashCache(cfg.SigCacheMaxSize),
 		cfCheckptCaches:      make(map[wire.FilterType][]cfHeaderKV),
@@ -2917,7 +3007,6 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	}
 
 	// Create a new block chain instance with the appropriate configuration.
-	var err error
 	s.chain, err = blockchain.New(&blockchain.Config{
 		DB:               s.db,
 		Interrupt:        interrupt,
@@ -2933,6 +3022,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	if err != nil {
 		return nil, err
 	}
+	s.chain.Subscribe(s.handleFountainBlockchainNotification)
 
 	// Search for a FeeEstimator state in the database. If none can be found
 	// or if it cannot be loaded, create a new one.

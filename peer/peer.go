@@ -44,6 +44,10 @@ const (
 	// outputBufferSize is the number of elements the output channels use.
 	outputBufferSize = 50
 
+	// fountainProtocolVersion is the initial Fountain Code sub-protocol
+	// version advertised via sendftn.
+	fountainProtocolVersion = 1
+
 	// invTrickleSize is the maximum amount of inventory to send in a single
 	// message when trickling inventory to remote peers.
 	maxInvTrickleSize = 1000
@@ -201,6 +205,27 @@ type MessageListeners struct {
 
 	// OnSendAddrV2 is invoked when a peer receives a sendaddrv2 message.
 	OnSendAddrV2 func(p *Peer, msg *wire.MsgSendAddrV2)
+
+	// OnSendFountain is invoked when a peer receives a sendftn message
+	// during the post-verack handshake. It signals that the remote peer
+	// supports the Fountain Code sub-protocol.
+	OnSendFountain func(p *Peer, msg *wire.MsgSendFountain)
+
+	// OnGetFtnEpochs is invoked when a peer requests our list of available
+	// Fountain Code epochs via a getftnepochs message.
+	OnGetFtnEpochs func(p *Peer, msg *wire.MsgGetFtnEpochs)
+
+	// OnFtnEpochs is invoked when a peer sends us its list of available
+	// Fountain Code epochs via a ftnepochs message.
+	OnFtnEpochs func(p *Peer, msg *wire.MsgFtnEpochs)
+
+	// OnGetDroplets is invoked when a peer requests a range of Fountain
+	// Code droplets via a getdroplets message.
+	OnGetDroplets func(p *Peer, msg *wire.MsgGetDroplets)
+
+	// OnDroplets is invoked when a peer delivers encoded Fountain Code
+	// droplets via a droplets message.
+	OnDroplets func(p *Peer, msg *wire.MsgDroplets)
 
 	// OnRead is invoked when a peer receives a bitcoin message.  It
 	// consists of the number of bytes read, the message, and whether or not
@@ -467,6 +492,10 @@ type Peer struct {
 	witnessEnabled       bool
 	sendAddrV2           bool
 
+	fountainMtx        sync.RWMutex
+	fountainNegotiated bool
+	fountainVersion    uint8
+
 	V2Transport *v2transport.Peer
 
 	wireEncoding wire.MessageEncoding
@@ -711,6 +740,29 @@ func (p *Peer) VerAckReceived() bool {
 	p.flagsMtx.Unlock()
 
 	return verAckReceived
+}
+
+// FountainNegotiated returns true if the Fountain Code sub-protocol handshake
+// has completed with this peer (i.e., both sides sent sendftn).
+//
+// This function is safe for concurrent access.
+func (p *Peer) FountainNegotiated() bool {
+	p.fountainMtx.RLock()
+	negotiated := p.fountainNegotiated
+	p.fountainMtx.RUnlock()
+	return negotiated
+}
+
+// FountainVersion returns the Fountain Code sub-protocol version negotiated
+// with this peer. The return value is only meaningful after FountainNegotiated
+// returns true.
+//
+// This function is safe for concurrent access.
+func (p *Peer) FountainVersion() uint8 {
+	p.fountainMtx.RLock()
+	ver := p.fountainVersion
+	p.fountainMtx.RUnlock()
+	return ver
 }
 
 // ProtocolVersion returns the negotiated peer protocol version.
@@ -1663,6 +1715,29 @@ out:
 				p.cfg.Listeners.OnSendHeaders(p, msg)
 			}
 
+		case *wire.MsgSendFountain:
+			p.processRemoteSendFountainMsg(msg)
+
+		case *wire.MsgGetFtnEpochs:
+			if p.cfg.Listeners.OnGetFtnEpochs != nil {
+				p.cfg.Listeners.OnGetFtnEpochs(p, msg)
+			}
+
+		case *wire.MsgFtnEpochs:
+			if p.cfg.Listeners.OnFtnEpochs != nil {
+				p.cfg.Listeners.OnFtnEpochs(p, msg)
+			}
+
+		case *wire.MsgGetDroplets:
+			if p.cfg.Listeners.OnGetDroplets != nil {
+				p.cfg.Listeners.OnGetDroplets(p, msg)
+			}
+
+		case *wire.MsgDroplets:
+			if p.cfg.Listeners.OnDroplets != nil {
+				p.cfg.Listeners.OnDroplets(p, msg)
+			}
+
 		default:
 			log.Debugf("Received unhandled message of type %v "+
 				"from %v", rmsg.Command(), p)
@@ -2128,6 +2203,19 @@ func (p *Peer) processRemoteVerAckMsg(msg *wire.MsgVerAck) {
 	}
 }
 
+// processRemoteSendFountainMsg records that the remote peer supports the
+// Fountain Code sub-protocol.
+func (p *Peer) processRemoteSendFountainMsg(msg *wire.MsgSendFountain) {
+	p.fountainMtx.Lock()
+	p.fountainNegotiated = true
+	p.fountainVersion = msg.Version
+	p.fountainMtx.Unlock()
+
+	if p.cfg.Listeners.OnSendFountain != nil {
+		p.cfg.Listeners.OnSendFountain(p, msg)
+	}
+}
+
 // localVersionMsg creates a version message that can be used to send to the
 // remote peer.
 func (p *Peer) localVersionMsg() (*wire.MsgVersion, error) {
@@ -2219,6 +2307,27 @@ func (p *Peer) writeSendAddrV2Msg(pver uint32) error {
 	return p.writeMessage(sendAddrMsg, wire.LatestEncoding)
 }
 
+// writeSendFountainMsg writes our sendftn message to the remote peer if both
+// peers advertised support for NODE_FOUNTAIN.
+func (p *Peer) writeSendFountainMsg() error {
+	p.flagsMtx.Lock()
+	remoteServices := p.services
+	p.flagsMtx.Unlock()
+
+	localSupportsFountain := p.cfg.Services&wire.SFNodeFountain ==
+		wire.SFNodeFountain
+	remoteSupportsFountain := remoteServices&wire.SFNodeFountain ==
+		wire.SFNodeFountain
+	if !localSupportsFountain || !remoteSupportsFountain {
+		return nil
+	}
+
+	return p.writeMessage(
+		wire.NewMsgSendFountain(fountainProtocolVersion),
+		wire.LatestEncoding,
+	)
+}
+
 // waitToFinishNegotiation waits until desired negotiation messages are
 // received, recording the remote peer's preference for sendaddrv2 as an
 // example. The list of negotiated features can be expanded in the future. If a
@@ -2248,6 +2357,9 @@ func (p *Peer) waitToFinishNegotiation(pver uint32) error {
 					p.cfg.Listeners.OnSendAddrV2(p, m)
 				}
 			}
+		case *wire.MsgSendFountain:
+			p.processRemoteSendFountainMsg(m)
+
 		case *wire.MsgVerAck:
 			// Receiving a verack means we are done with the
 			// handshake.
@@ -2328,6 +2440,10 @@ func (p *Peer) negotiateInboundProtocol() error {
 		return err
 	}
 
+	if err := p.writeSendFountainMsg(); err != nil {
+		return err
+	}
+
 	err := p.writeMessage(wire.NewMsgVerAck(), wire.LatestEncoding)
 	if err != nil {
 		return err
@@ -2388,6 +2504,10 @@ func (p *Peer) negotiateOutboundProtocol() error {
 	p.flagsMtx.Unlock()
 
 	if err := p.writeSendAddrV2Msg(protoVersion); err != nil {
+		return err
+	}
+
+	if err := p.writeSendFountainMsg(); err != nil {
 		return err
 	}
 
