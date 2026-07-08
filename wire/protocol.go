@@ -107,6 +107,10 @@ const (
 	// SFNodeP2PV2 is a flag used to indicate a peer supports BIP324 v2
 	// connections.
 	SFNodeP2PV2 = 1 << 11
+
+	// SFNodeFountain is a flag used to indicate a peer supports Fountain
+	// Code droplet relay.
+	SFNodeFountain = 1 << 12
 )
 
 // Map of service flags back to their constant names for pretty printing.
@@ -121,6 +125,7 @@ var sfStrings = map[ServiceFlag]string{
 	SFNode2X:             "SFNode2X",
 	SFNodeNetworkLimited: "SFNodeNetworkLimited",
 	SFNodeP2PV2:          "SFNodeP2PV2",
+	SFNodeFountain:       "SFNodeFountain",
 }
 
 // orderedSFStrings is an ordered list of service flags from highest to
@@ -136,6 +141,7 @@ var orderedSFStrings = []ServiceFlag{
 	SFNode2X,
 	SFNodeNetworkLimited,
 	SFNodeP2PV2,
+	SFNodeFountain,
 }
 
 // HasFlag returns a bool indicating if the service has the given flag.
