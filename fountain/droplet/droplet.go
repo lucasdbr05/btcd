@@ -57,6 +57,15 @@ func NewEpochParams(epochID uint64, k uint32, seed [32]byte) EpochParams {
 	}
 }
 
+func (p *EpochParams) DeriveIndices(dist distribution.DegreeDistribution,
+	dropletID uint64) []uint32 {
+
+	k := int(p.K)
+	rng := p.dropletRNG(dropletID)
+	degree := dist.SampleDegree(rng)
+	return sampleIndices(rng, k, degree)
+}
+
 func (p *EpochParams) dropletRNG(dropletID uint64) *rand.Rand {
 	h := sha256.New()
 	h.Write(p.EpochSeed[:])
@@ -81,11 +90,7 @@ func NewEncoder(params *EpochParams, dist distribution.DegreeDistribution, block
 }
 
 func (e *Encoder) Generate(dropletID uint64) Droplet {
-	k := int(e.params.K)
-	rng := e.params.dropletRNG(dropletID)
-
-	degree := e.dist.SampleDegree(rng)
-	indices := sampleIndices(rng, k, degree)
+	indices := e.params.DeriveIndices(e.dist, dropletID)
 
 	selected := make([][]byte, len(indices))
 	var paddedLen int
@@ -109,11 +114,7 @@ func (e *Encoder) Generate(dropletID uint64) Droplet {
 }
 
 func (e *Encoder) GenerateInto(dropletID uint64, indicesBuf *[]uint32, payloadBuf []byte) (int, uint32) {
-	k := int(e.params.K)
-	rng := e.params.dropletRNG(dropletID)
-
-	degree := e.dist.SampleDegree(rng)
-	indices := sampleIndices(rng, k, degree)
+	indices := e.params.DeriveIndices(e.dist, dropletID)
 	*indicesBuf = append((*indicesBuf)[:0], indices...)
 
 	paddedLen := 0
@@ -136,7 +137,7 @@ func (e *Encoder) GenerateInto(dropletID uint64, indicesBuf *[]uint32, payloadBu
 		}
 	}
 
-	return degree, uint32(paddedLen)
+	return len(indices), uint32(paddedLen)
 }
 
 func (e *Encoder) GenerateN(n uint64) []Droplet {
