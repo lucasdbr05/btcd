@@ -31,6 +31,8 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/connmgr"
 	"github.com/btcsuite/btcd/database"
+	"github.com/btcsuite/btcd/fountain/bootstrap"
+	"github.com/btcsuite/btcd/fountain/decoder"
 	"github.com/btcsuite/btcd/fountain/fountainmanager"
 	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/mining"
@@ -196,6 +198,87 @@ type cfHeaderKV struct {
 	filterHeader chainhash.Hash
 }
 
+type fountainPeerEpoch struct {
+	peerID int32
+	addr   string
+	info   wire.FtnEpochInfo
+}
+
+type remoteFountainInventory struct {
+	mtx    sync.RWMutex
+	epochs map[uint64]map[int32]fountainPeerEpoch
+}
+
+func newRemoteFountainInventory() *remoteFountainInventory {
+	return &remoteFountainInventory{
+		epochs: make(map[uint64]map[int32]fountainPeerEpoch),
+	}
+}
+
+func (i *remoteFountainInventory) register(peerID int32, addr string,
+	epoch wire.FtnEpochInfo) {
+
+	i.mtx.Lock()
+	defer i.mtx.Unlock()
+
+	peers, ok := i.epochs[epoch.EpochID]
+	if !ok {
+		peers = make(map[int32]fountainPeerEpoch)
+		i.epochs[epoch.EpochID] = peers
+	}
+	peers[peerID] = fountainPeerEpoch{
+		peerID: peerID,
+		addr:   addr,
+		info:   epoch,
+	}
+}
+
+func (i *remoteFountainInventory) peersForEpoch(epochID uint64) []fountainPeerEpoch {
+	i.mtx.RLock()
+	defer i.mtx.RUnlock()
+
+	peers := i.epochs[epochID]
+	if len(peers) == 0 {
+		return nil
+	}
+
+	out := make([]fountainPeerEpoch, 0, len(peers))
+	for _, peerEpoch := range peers {
+		out = append(out, peerEpoch)
+	}
+	sort.Slice(out, func(a, b int) bool {
+		return out[a].peerID < out[b].peerID
+	})
+	return out
+}
+
+func (i *remoteFountainInventory) peerEpoch(epochID uint64,
+	peerID int32) (fountainPeerEpoch, bool) {
+
+	i.mtx.RLock()
+	defer i.mtx.RUnlock()
+
+	peers := i.epochs[epochID]
+	if len(peers) == 0 {
+		return fountainPeerEpoch{}, false
+	}
+
+	peerEpoch, ok := peers[peerID]
+	return peerEpoch, ok
+}
+
+func (i *remoteFountainInventory) removePeer(peerID int32) {
+	i.mtx.Lock()
+	defer i.mtx.Unlock()
+
+	for epochID, peers := range i.epochs {
+		delete(peers, peerID)
+		if len(peers) == 0 {
+			delete(i.epochs, epochID)
+		}
+	}
+}
+
 // server provides a bitcoin server for handling communications to and from
 // bitcoin peers.
 type server struct {
@@ -234,6 +317,9 @@ type server struct {
 	timeSource           blockchain.MedianTimeSource
 	services             wire.ServiceFlag
 	fountainManager      *manager.Manager
+	fountainRemoteInv    *remoteFountainInventory
+	fountainBootstrap    *bootstrap.Collector
+	fountainHeaders      fountainHeaderSource
 
 	// The following fields are used for optional indexes.  They will be nil
 	// if the associated index is not enabled.  These fields are set during
@@ -1481,9 +1567,39 @@ func (s *server) handleFountainBlockchainNotification(notification *blockchain.N
 		return
 	}
 	if completed {
-		srvrLog.Infof("Generated %d fountain droplets for epoch %d",
-			epoch.NumDroplets, epoch.EpochID)
+		if stats, ok := s.fountainManager.EncodingStats(epoch.EpochID); ok {
+			padding := uint64(stats.PaddedLen)*uint64(stats.BlockCount) -
+				stats.SourceBytes
+			srvrLog.Infof("Generated %d fountain droplets for epoch %d "+
+				"(source_bytes=%d padded_len=%d padding_bytes=%d)",
+				epoch.NumDroplets, epoch.EpochID, stats.SourceBytes,
+				stats.PaddedLen, padding)
+		} else {
+			srvrLog.Infof("Generated %d fountain droplets for epoch %d",
+				epoch.NumDroplets, epoch.EpochID)
+		}
+		s.announceFountainEpoch(epoch)
 	}
+
+	s.retryPendingFountainDecodes()
+}
+
+func (s *server) announceFountainEpoch(epoch wire.FtnEpochInfo) {
+	msg := wire.NewMsgFtnEpochs()
+	msg.Epochs = append(msg.Epochs, &epoch)
+
+	peers := s.ConnectedPeers()
+	announced := 0
+	for _, sp := range peers {
+		if sp == nil || !sp.FountainNegotiated() {
+			continue
+		}
+		sp.QueueMessage(msg, nil)
+		announced++
+	}
+
+	srvrLog.Debugf("Announced fountain epoch %d to %d peers",
+		epoch.EpochID, announced)
 }
 
 func (sp *serverPeer) OnSendFountain(_ *peer.Peer, msg *wire.MsgSendFountain) {
@@ -1494,49 +1610,214 @@ func (sp *serverPeer) OnSendFountain(_ *peer.Peer, msg *wire.MsgSendFountain) {
 func (sp *serverPeer) OnGetFtnEpochs(_ *peer.Peer, msg *wire.MsgGetFtnEpochs) {
 	_ = msg
 
-	sp.QueueMessage(sp.server.fountainManager.FtnEpochsMessage(), nil)
+	epochsMsg := sp.server.fountainManager.FtnEpochsMessage()
+	srvrLog.Debugf("Serving %d fountain epochs to peer %s",
+		len(epochsMsg.Epochs), sp.Addr())
+	sp.QueueMessage(epochsMsg, nil)
 }
 
 func (sp *serverPeer) OnFtnEpochs(_ *peer.Peer, msg *wire.MsgFtnEpochs) {
-	registered := 0
+	available := 0
 	for _, epoch := range msg.Epochs {
 		if epoch == nil {
 			continue
 		}
-		if err := sp.server.fountainManager.RegisterEpoch(*epoch); err != nil {
-			srvrLog.Debugf("Unable to register fountain epoch %d from peer %s: %v", epoch.EpochID, sp.Addr(), err)
+		if err := sp.server.fountainBootstrap.RegisterEpoch(
+			sp.ID(), *epoch,
+		); err != nil {
+			srvrLog.Debugf("Ignoring fountain epoch %d from peer %s: %v",
+				epoch.EpochID, sp.Addr(), err)
 			continue
 		}
-		registered++
+		sp.server.fountainRemoteInv.register(
+			sp.ID(), sp.Addr(), *epoch,
+		)
+		requestDroplets := epoch.NumDroplets
+		if requestDroplets > wire.MaxDropletsPerRequest {
+			requestDroplets = wire.MaxDropletsPerRequest
+		}
+		if requestDroplets > 0 {
+			sp.QueueMessage(wire.NewMsgGetDroplets(
+				epoch.EpochID, 0, requestDroplets,
+			), nil)
+		}
+		available++
 	}
 
-	srvrLog.Debugf("Registered %d fountain epochs from peer %s",
-		registered, sp.Addr())
+	srvrLog.Debugf("Peer %s announced %d fountain epochs",
+		sp.Addr(), available)
 }
 
 func (sp *serverPeer) OnGetDroplets(_ *peer.Peer, msg *wire.MsgGetDroplets) {
-	for i := uint64(0); i < msg.Count; i++ {
-		dropletsMsg, err := sp.server.fountainManager.DropletsMessage(
-			msg.EpochID, msg.StartID+i, 1,
-		)
-		if err != nil {
-			srvrLog.Debugf("Unable to serve fountain droplet to peer %s for epoch %d at droplet %d: %v",
-				sp.Addr(), msg.EpochID, msg.StartID+i, err)
-			return
-		}
-		sp.QueueMessage(dropletsMsg, nil)
+	dropletsMsg, err := sp.server.fountainManager.DropletsMessage(
+		msg.EpochID, msg.StartID, msg.Count,
+	)
+	if err != nil {
+		srvrLog.Debugf("Unable to serve fountain droplets to peer %s for epoch %d: %v",
+			sp.Addr(), msg.EpochID, msg.StartID, msg.StartID+msg.Count, err)
+		return
 	}
+	sp.QueueMessage(dropletsMsg, nil)
+
+	srvrLog.Debugf("Served %d fountain droplets to peer %s for epoch %d range [%d, %d)",
+		len(dropletsMsg.Droplets), sp.Addr(), msg.EpochID, msg.StartID,
+		msg.StartID+msg.Count)
 }
 
 func (sp *serverPeer) OnDroplets(_ *peer.Peer, msg *wire.MsgDroplets) {
-	if err := sp.server.fountainManager.PutDroplets(
-		msg.EpochID, msg.Droplets,
-	); err != nil {
-		srvrLog.Debugf("Unable to store fountain droplets from peer %s for epoch %d: %v", sp.Addr(), msg.EpochID, err)
+	added, err := sp.server.fountainBootstrap.AddDroplets(
+		msg.EpochID, sp.ID(), msg.Droplets,
+	)
+	if err != nil {
+		srvrLog.Debugf("Unable to collect fountain droplets from peer %s for epoch %d: %v", sp.Addr(), msg.EpochID, err)
 		return
 	}
 
-	srvrLog.Debugf("Stored %d fountain droplets from peer %s for epoch %d", len(msg.Droplets), sp.Addr(), msg.EpochID)
+	total := sp.server.fountainBootstrap.DropletCount(msg.EpochID)
+	srvrLog.Debugf("Collected %d new fountain droplets from peer %s for epoch %d (total %d)",
+		added, sp.Addr(), msg.EpochID, total)
+
+	decoded, verifyFailures := sp.server.tryDecodeFountainEpoch(
+		msg.EpochID, total,
+	)
+	if verifyFailures > 0 {
+		removed := sp.server.fountainBootstrap.RemovePeer(
+			msg.EpochID, sp.ID(),
+		)
+		reason := fmt.Sprintf("invalid fountain droplets for epoch %d",
+			msg.EpochID)
+		srvrLog.Warnf("Disconnecting peer %s after %d fountain verification failures for epoch %d; removed %d collected droplets",
+			sp.Addr(), verifyFailures, msg.EpochID, removed)
+		sp.server.fountainRemoteInv.removePeer(sp.ID())
+		if !sp.addBanScore(100, 0, reason) {
+			sp.Disconnect()
+		}
+		return
+	}
+	if decoded {
+		return
+	}
+	peerTotal := sp.server.fountainBootstrap.PeerDropletCount(
+		msg.EpochID, sp.ID(),
+	)
+	sp.requestMoreFountainDroplets(msg.EpochID, uint64(peerTotal))
+}
+
+func (sp *serverPeer) requestMoreFountainDroplets(epochID, startID uint64) {
+	peerEpoch, ok := sp.server.fountainRemoteInv.peerEpoch(
+		epochID, sp.ID(),
+	)
+	if !ok || startID >= peerEpoch.info.NumDroplets {
+		return
+	}
+
+	count := peerEpoch.info.NumDroplets - startID
+	if count > wire.MaxDropletsPerRequest {
+		count = wire.MaxDropletsPerRequest
+	}
+	sp.QueueMessage(wire.NewMsgGetDroplets(epochID, startID, count), nil)
+}
+
+func (s *server) tryDecodeFountainEpoch(epochID uint64,
+	dropletCount int) (bool, int) {
+
+	if s.fountainBootstrap.Decoded(epochID) {
+		return true, 0
+	}
+	if dropletCount < s.fountainBootstrap.DecodeThreshold() {
+		return false, 0
+	}
+
+	verifier, err := s.fountainBlockVerifier(epochID)
+	if err != nil {
+		srvrLog.Debugf("Unable to build fountain verifier for epoch %d: %v",
+			epochID, err)
+		return false, 0
+	}
+
+	result, err := s.fountainBootstrap.DecodeEpoch(epochID, verifier)
+	if err != nil {
+		srvrLog.Debugf("Unable to decode fountain epoch %d: %v",
+			epochID, err)
+		return false, 0
+	}
+	if result.VerifyFailures > 0 {
+		return false, result.VerifyFailures
+	}
+	if !result.IsSuccess() {
+		srvrLog.Debugf("Fountain decode for epoch %d stalled after %d/%d blocks with %d droplets",
+			epochID, result.DecodedCount, result.K, dropletCount)
+		return false, 0
+	}
+
+	s.fountainBootstrap.MarkDecoded(epochID)
+	srvrLog.Infof("Decoded fountain epoch %d from %d droplets (%d blocks, %d iterations)",
+		epochID, dropletCount, result.DecodedCount, result.Iterations)
+	return true, 0
+}
+
+// retryPendingFountainDecodes retries epochs that were previously collected
+// with enough droplets but could not yet be decoded, for example because the
+// corresponding headers were not available when the droplets arrived.
+func (s *server) retryPendingFountainDecodes() {
+	for _, epochID := range s.fountainBootstrap.DecodableEpochs() {
+		dropletCount := s.fountainBootstrap.DropletCount(epochID)
+		decoded, verifyFailures := s.tryDecodeFountainEpoch(
+			epochID, dropletCount,
+		)
+		if verifyFailures > 0 {
+			srvrLog.Warnf("Fountain retry for epoch %d found %d invalid droplets",
+				epochID, verifyFailures)
+			continue
+		}
+		if decoded {
+			srvrLog.Debugf("Fountain retry decoded epoch %d", epochID)
+		}
+	}
+}
+
+func (s *server) fountainBlockVerifier(epochID uint64) (decoder.BlockVerifier, error) {
+	k := s.fountainBootstrap.DecodeThreshold()
+	headers := s.fountainHeaders
+	if headers == nil {
+		headers = s.chain
+	}
+	return newFountainBlockVerifier(headers, epochID, k)
+}
+
+type fountainHeaderSource interface {
+	BlockHashByHeight(blockHeight int32) (*chainhash.Hash, error)
+	HeaderByHash(hash *chainhash.Hash) (wire.BlockHeader, error)
+}
+
+func newFountainBlockVerifier(chain fountainHeaderSource, epochID uint64,
+	k int) (decoder.BlockVerifier, error) {
+
+	if k <= 0 {
+		return nil, fmt.Errorf("invalid fountain decode threshold %d", k)
+	}
+
+	startHeight := int64(epochID) * int64(k)
+	if startHeight > int64(math.MaxInt32) {
+		return nil, fmt.Errorf("epoch %d start height %d overflows int32",
+			epochID, startHeight)
+	}
+
+	headers := make([]wire.BlockHeader, 0, k)
+	for i := range k {
+		height := int32(startHeight) + int32(i)
+		hash, err := chain.BlockHashByHeight(height)
+		if err != nil {
+			return nil, err
+		}
+		header, err := chain.HeaderByHash(hash)
+		if err != nil {
+			return nil, err
+		}
+		headers = append(headers, header)
+	}
+
+	return decoder.NewBitcoinBlockVerifier(headers), nil
 }
 
 // OnRead is invoked when a peer receives a message and it is used to update
@@ -1985,6 +2266,7 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 			state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
 		}
 		delete(list, sp.ID())
+		s.fountainRemoteInv.removePeer(sp.ID())
 		srvrLog.Debugf("Removed peer %s", sp)
 		return
 	}
@@ -2527,6 +2809,14 @@ func (s *server) ConnectedCount() int32 {
 	return <-replyChan
 }
 
+func (s *server) ConnectedPeers() []*serverPeer {
+	replyChan := make(chan []*serverPeer)
+
+	s.query <- getPeersMsg{reply: replyChan}
+
+	return <-replyChan
+}
+
 // OutboundGroupCount returns the number of peers connected to the given
 // outbound group key.
 func (s *server) OutboundGroupCount(key string) int {
@@ -2928,10 +3218,23 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		srvrLog.Infof("User-agent whitelist %s", agentWhitelist)
 	}
 
-	fountainManager, err := manager.NewPersistent(db, manager.DefaultConfig())
+	fountainConfig := manager.DefaultConfig()
+	if cfg.FountainK != 0 {
+		fountainConfig.K = cfg.FountainK
+	}
+	if cfg.FountainS != 0 {
+		fountainConfig.S = cfg.FountainS
+	}
+	fountainManager, err := manager.NewPersistent(db, fountainConfig)
 	if err != nil {
 		return nil, err
 	}
+	fountainConfig = fountainManager.Config()
+	fountainBootstrap := bootstrap.NewCollector(bootstrap.Config{
+		K:     fountainConfig.K,
+		C:     fountainConfig.C,
+		Delta: fountainConfig.Delta,
+	})
 
 	s := server{
 		chainParams:          chainParams,
@@ -2950,6 +3253,8 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		timeSource:           blockchain.NewMedianTime(),
 		services:             services,
 		fountainManager:      fountainManager,
+		fountainRemoteInv:    newRemoteFountainInventory(),
+		fountainBootstrap:    fountainBootstrap,
 		sigCache:             txscript.NewSigCache(cfg.SigCacheMaxSize),
 		hashCache:            txscript.NewHashCache(cfg.SigCacheMaxSize),
 		cfCheckptCaches:      make(map[wire.FilterType][]cfHeaderKV),
@@ -3022,6 +3327,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	if err != nil {
 		return nil, err
 	}
+	s.fountainHeaders = s.chain
 	s.chain.Subscribe(s.handleFountainBlockchainNotification)
 
 	// Search for a FeeEstimator state in the database. If none can be found

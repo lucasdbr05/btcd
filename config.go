@@ -123,6 +123,8 @@ type config struct {
 	DropCfIndex          bool          `long:"dropcfindex" description:"Deletes the index used for committed filtering (CF) support from the database on start up and then exits."`
 	DropTxIndex          bool          `long:"droptxindex" description:"Deletes the hash-based transaction index from the database on start up and then exits."`
 	ExternalIPs          []string      `long:"externalip" description:"Add an ip to the list of local addresses we claim to listen on to peers"`
+	FountainK            uint32        `long:"fountaink" description:"Override the number of source blocks per Fountain epoch (0 uses the default)"`
+	FountainS            uint64        `long:"fountains" description:"Override the number of Fountain droplets generated per epoch (0 uses the default)"`
 	Generate             bool          `long:"generate" description:"Generate (mine) bitcoins using the CPU"`
 	FreeTxRelayLimit     float64       `long:"limitfreerelay" description:"Limit relay of transactions with no transaction fee to the given amount in thousands of bytes per minute"`
 	Listeners            []string      `long:"listen" description:"Add an interface/port to listen for connections (default all interfaces port: 8333, testnet: 18333)"`
