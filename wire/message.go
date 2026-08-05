@@ -59,11 +59,11 @@ const (
 	CmdCFCheckpt    = "cfcheckpt"
 	CmdSendAddrV2   = "sendaddrv2"
 	CmdWTxIdRelay   = "wtxidrelay"
-	CmdSendFountain = "sendftn"      
-	CmdGetFtnEpochs = "getftnepochs" 
-	CmdFtnEpochs    = "ftnepochs"    
-	CmdGetDroplets  = "getdroplets"  
-	CmdDroplets     = "droplets"     
+	CmdSendFountain = "sendftn"
+	CmdGetFtnEpochs = "getftnepochs"
+	CmdFtnEpochs    = "ftnepochs"
+	CmdGetDroplets  = "getdroplets"
+	CmdDroplets     = "droplets"
 )
 
 var (
