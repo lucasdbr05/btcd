@@ -136,6 +136,29 @@ func TestGenerateIntoMatchesGenerate(t *testing.T) {
 	}
 }
 
+func TestDeriveIndicesMatchesGenerate(t *testing.T) {
+	k := 20
+	blocks := testBlocks(k)
+	params := NewEpochParams(3, uint32(k), [32]byte{9, 8, 7})
+	dist := distribution.NewRobustSoliton(k, 0.1, 0.5)
+	encoder := NewEncoder(&params, dist, blocks)
+
+	for dropletID := uint64(0); dropletID < 50; dropletID++ {
+		d := encoder.Generate(dropletID)
+		indices := params.DeriveIndices(dist, dropletID)
+		if len(indices) != len(d.Indices) {
+			t.Fatalf("droplet %d degree = %d, want %d",
+				dropletID, len(indices), len(d.Indices))
+		}
+		for i := range indices {
+			if indices[i] != d.Indices[i] {
+				t.Fatalf("droplet %d index %d = %d, want %d",
+					dropletID, i, indices[i], d.Indices[i])
+			}
+		}
+	}
+}
+
 func TestValidateCatchesBadDroplet(t *testing.T) {
 	d := Droplet{Indices: []uint32{5, 3}, PaddedLen: 10, Payload: make([]byte, 10)}
 	if d.Validate(100) == nil {
