@@ -140,6 +140,7 @@ var orderedSFStrings = []ServiceFlag{
 	SFNodeCF,
 	SFNode2X,
 	SFNodeNetworkLimited,
+	SFNodeFountain,
 	SFNodeP2PV2,
 	SFNodeFountain,
 }
