@@ -4,6 +4,7 @@
 package integration
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/integration/p2ptest"
 	"github.com/btcsuite/btcd/integration/rpctest"
 	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/wire/v2"
@@ -360,49 +362,32 @@ func TestSyncManagerRaceCorruption(t *testing.T) {
 // dialPreVerackPeer connects to nodeAddr and exchanges version messages without
 // sending verack. The caller is responsible for closing the returned
 // connection.
-func dialPreVerackPeer(nodeAddr string) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", nodeAddr, 5*time.Second)
+func dialPreVerackPeer(nodeAddr string) (*p2ptest.Session, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	peer, err := p2ptest.Dial(ctx, p2ptest.Config{
+		Address:         nodeAddr,
+		Params:          &chaincfg.SimNetParams,
+		Mode:            p2ptest.ManualHandshake,
+		Services:        wire.SFNodeNetwork | wire.SFNodeWitness,
+		DisableAutoPong: true,
+	})
 	if err != nil {
 		return nil, err
 	}
 	connected := false
 	defer func() {
 		if !connected {
-			_ = conn.Close()
+			_ = peer.Close()
 		}
 	}()
 
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	nodeTCP, err := net.ResolveTCPAddr("tcp", nodeAddr)
-	if err != nil {
+	if err := peer.Send(ctx, peer.VersionMessage()); err != nil {
 		return nil, err
 	}
 
-	you := wire.NewNetAddress(
-		nodeTCP, wire.SFNodeNetwork|wire.SFNodeWitness,
-	)
-	me := wire.NewNetAddress(
-		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0},
-		wire.SFNodeNetwork|wire.SFNodeWitness,
-	)
-	you.Timestamp = time.Time{}
-	me.Timestamp = time.Time{}
-
-	nonce := uint64(rand.Int63())
-	msgVersion := wire.NewMsgVersion(me, you, nonce, 0)
-	msgVersion.Services = wire.SFNodeNetwork | wire.SFNodeWitness
-
-	err = wire.WriteMessage(
-		conn, msgVersion, wire.ProtocolVersion, wire.SimNet,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	msg, _, err := wire.ReadMessage(
-		conn, wire.ProtocolVersion, wire.SimNet,
-	)
+	msg, err := peer.WaitFor(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +396,7 @@ func dialPreVerackPeer(nodeAddr string) (net.Conn, error) {
 	}
 
 	connected = true
-	return conn, nil
+	return peer, nil
 }
 
 // TestPreVerackDisconnect verifies that a peer disconnecting
