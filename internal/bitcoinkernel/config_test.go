@@ -2,8 +2,20 @@ package bitcoinkernel
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 )
+
+func testConfig(t *testing.T, chain Chain) Config {
+	t.Helper()
+
+	rootDir := t.TempDir()
+	return Config{
+		Chain:     chain,
+		DataDir:   filepath.Join(rootDir, "data"),
+		BlocksDir: filepath.Join(rootDir, "blocks"),
+	}
+}
 
 func TestChainString(t *testing.T) {
 	t.Parallel()
@@ -36,13 +48,67 @@ func TestChainString(t *testing.T) {
 func TestOpenRejectsInvalidChain(t *testing.T) {
 	t.Parallel()
 
-	kernel, err := Open(Config{Chain: Chain(255)})
+	cfg := testConfig(t, Chain(255))
+	kernel, err := Open(cfg)
 	if !errors.Is(err, ErrInvalidChain) {
 		t.Fatalf("unexpected error: got %v, want %v", err,
 			ErrInvalidChain)
 	}
 	if kernel != nil {
 		t.Fatal("invalid configuration returned a kernel")
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		update func(*Config)
+		want   error
+	}{
+		{
+			name: "missing data directory",
+			update: func(cfg *Config) {
+				cfg.DataDir = ""
+			},
+			want: ErrInvalidDataDir,
+		},
+		{
+			name: "relative blocks directory",
+			update: func(cfg *Config) {
+				cfg.BlocksDir = "blocks"
+			},
+			want: ErrInvalidBlocksDir,
+		},
+		{
+			name: "too many workers",
+			update: func(cfg *Config) {
+				cfg.WorkerThreads = 16
+			},
+			want: ErrInvalidWorkerThreads,
+		},
+		{
+			name: "cache below minimum",
+			update: func(cfg *Config) {
+				cfg.DBCacheBytes = minDatabaseCacheBytes - 1
+			},
+			want: ErrInvalidDBCache,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := testConfig(t, Regtest)
+			test.update(&cfg)
+			if err := cfg.validate(); !errors.Is(err, test.want) {
+				t.Fatalf("unexpected error: got %v, want %v", err,
+					test.want)
+			}
+		})
 	}
 }
 

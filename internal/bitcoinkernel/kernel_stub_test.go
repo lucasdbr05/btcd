@@ -10,7 +10,7 @@ import (
 func TestKernelUnavailable(t *testing.T) {
 	t.Parallel()
 
-	kernel, err := Open(Config{Chain: Regtest})
+	kernel, err := Open(testConfig(t, Regtest))
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("unexpected error: got %v, want %v", err, ErrUnavailable)
 	}

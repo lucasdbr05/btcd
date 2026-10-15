@@ -5,7 +5,8 @@ package bitcoinkernel
 import "sync"
 
 type kernelBackend interface {
-	close()
+	interrupt() error
+	close() error
 }
 
 // Kernel owns a libbitcoinkernel context.
@@ -44,8 +45,24 @@ func (k *Kernel) Close() error {
 		return nil
 	}
 
-	k.backend.close()
+	err := k.backend.close()
 	k.backend = nil
 
-	return nil
+	return err
+}
+
+// Interrupt requests cancellation of long-running kernel operations.
+func (k *Kernel) Interrupt() error {
+	if k == nil {
+		return ErrClosed
+	}
+
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	if k.backend == nil {
+		return ErrClosed
+	}
+
+	return k.backend.interrupt()
 }
