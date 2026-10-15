@@ -120,3 +120,23 @@ func TestNilKernelClose(t *testing.T) {
 		t.Fatalf("unable to close a nil kernel: %v", err)
 	}
 }
+
+func TestProcessBlockInputValidation(t *testing.T) {
+	t.Parallel()
+
+	var kernel *Kernel
+	if _, err := kernel.ProcessBlock([]byte{0x00}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("unexpected nil kernel error: got %v, want %v", err,
+			ErrClosed)
+	}
+
+	kernel = &Kernel{}
+	if _, err := kernel.ProcessBlock(nil); !errors.Is(err, ErrEmptyBlock) {
+		t.Fatalf("unexpected empty block error: got %v, want %v", err,
+			ErrEmptyBlock)
+	}
+	if _, err := kernel.ProcessBlock([]byte{0x00}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("unexpected closed kernel error: got %v, want %v", err,
+			ErrClosed)
+	}
+}
