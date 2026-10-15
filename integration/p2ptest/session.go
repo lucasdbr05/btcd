@@ -43,6 +43,33 @@ const (
 	ManualHandshake
 )
 
+// ConnectionState describes whether the remote connection is still usable.
+type ConnectionState uint8
+
+const (
+	// Connected means the session has not observed a terminal connection
+	// error.
+	Connected ConnectionState = iota
+
+	// Closed means the connection was closed locally or by the remote peer.
+	Closed
+)
+
+// HandshakeStatus describes the observed progress of the version/verack
+// exchange. A handshake is complete once all four fields are true.
+type HandshakeStatus struct {
+	VersionSent     bool
+	VersionReceived bool
+	VerAckSent      bool
+	VerAckReceived  bool
+}
+
+// Complete reports whether the version/verack exchange completed.
+func (s HandshakeStatus) Complete() bool {
+	return s.VersionSent && s.VersionReceived && s.VerAckSent &&
+		s.VerAckReceived
+}
+
 // Config describes a v1 P2P test connection. Address and Params are required.
 // Zero ProtocolVersion, MessageLimit, and TranscriptLimit use defaults.
 type Config struct {
@@ -70,6 +97,9 @@ type Session struct {
 	mu         sync.Mutex
 	messages   []wire.Message
 	transcript []string
+	counts     map[string]uint64
+	last       map[string]wire.Message
+	handshake  HandshakeStatus
 	handlers   map[string][]func(wire.Message) error
 	notify     chan struct{}
 	cause      error
@@ -116,6 +146,8 @@ func Dial(ctx context.Context, cfg Config) (*Session, error) {
 		cfg:      cfg,
 		notify:   make(chan struct{}),
 		readDone: make(chan struct{}),
+		counts:   make(map[string]uint64),
+		last:     make(map[string]wire.Message),
 	}
 	s.pver.Store(cfg.ProtocolVersion)
 	go s.readLoop()
@@ -210,6 +242,7 @@ func (s *Session) Send(ctx context.Context, msg wire.Message) error {
 		s.terminate(err)
 		return s.wrap("send "+msg.Command(), err)
 	}
+	s.noteSent(msg)
 	return nil
 }
 
@@ -282,6 +315,54 @@ func (s *Session) WaitForCommand(ctx context.Context, command string) (wire.Mess
 	})
 }
 
+// WaitForCommandCount waits until at least count messages with command have
+// been received. Unlike WaitForCommand, it does not consume messages.
+func (s *Session) WaitForCommandCount(ctx context.Context, command string,
+	count uint64) error {
+
+	if count == 0 {
+		return nil
+	}
+	for {
+		seen, cause, notify := s.commandCount(command)
+		if seen >= count {
+			return nil
+		}
+		if cause != nil {
+			return s.wrap("wait for "+command, cause)
+		}
+		select {
+		case <-notify:
+		case <-ctx.Done():
+			return s.wrap("wait for "+command, ctx.Err())
+		}
+	}
+}
+
+// WaitForTx waits for and consumes a transaction with hash.
+func (s *Session) WaitForTx(ctx context.Context, hash chainhash.Hash) (*wire.MsgTx, error) {
+	msg, err := s.WaitFor(ctx, func(msg wire.Message) bool {
+		tx, ok := msg.(*wire.MsgTx)
+		return ok && tx.TxHash() == hash
+	})
+	if err != nil {
+		return nil, err
+	}
+	return msg.(*wire.MsgTx), nil
+}
+
+// WaitForBlock waits for and consumes a block with hash.
+func (s *Session) WaitForBlock(ctx context.Context, hash chainhash.Hash) (*wire.MsgBlock, error) {
+	msg, err := s.WaitFor(ctx, func(msg wire.Message) bool {
+		block, ok := msg.(*wire.MsgBlock)
+		return ok && block.BlockHash() == hash
+	})
+	if err != nil {
+		return nil, err
+	}
+	return msg.(*wire.MsgBlock), nil
+}
+
 // On registers a callback for incoming messages with command. A callback runs
 // on the reader goroutine, in arrival order, after the message has been queued.
 func (s *Session) On(command string, handler func(wire.Message) error) {
@@ -323,6 +404,59 @@ func (s *Session) WaitForInv(ctx context.Context, hash chainhash.Hash) (*wire.In
 	return nil, s.wrap("find inventory", errors.New("matching inventory disappeared"))
 }
 
+// MessageCount returns the number of received messages with command. It does
+// not change when a message is consumed with WaitFor.
+func (s *Session) MessageCount(command string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.counts[command]
+}
+
+// LastMessage returns the latest received message with command. The returned
+// message is owned by the session and must be treated as read-only.
+func (s *Session) LastMessage(command string) (wire.Message, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	msg, ok := s.last[command]
+	return msg, ok
+}
+
+// State reports whether the connection is still usable.
+func (s *Session) State() ConnectionState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cause != nil {
+		return Closed
+	}
+	return Connected
+}
+
+// CloseReason returns the terminal connection error, or nil while connected.
+func (s *Session) CloseReason() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cause
+}
+
+// HandshakeStatus returns a snapshot of the observed version/verack exchange.
+func (s *Session) HandshakeStatus() HandshakeStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.handshake
+}
+
+// WaitForDisconnect waits until the reader goroutine stops after a terminal
+// connection error.
+func (s *Session) WaitForDisconnect(ctx context.Context) error {
+	select {
+	case <-s.readDone:
+		cause := s.CloseReason()
+		return s.wrap("wait for disconnect", cause)
+	case <-ctx.Done():
+		return s.wrap("wait for disconnect", ctx.Err())
+	}
+}
+
 // Transcript returns a bounded chronological summary of sent and received
 // messages. Wait errors include this summary for diagnosis.
 func (s *Session) Transcript() []string {
@@ -331,10 +465,11 @@ func (s *Session) Transcript() []string {
 	return append([]string(nil), s.transcript...)
 }
 
-// Close disconnects and waits for the reader goroutine. It is idempotent.
+// Close disconnects the session. It is idempotent and does not wait for the
+// reader goroutine, so callbacks may safely call it. Use WaitForDisconnect to
+// wait for the reader to observe the close.
 func (s *Session) Close() error {
 	s.terminate(ErrClosed)
-	<-s.readDone
 	return nil
 }
 
@@ -362,6 +497,9 @@ func (s *Session) readLoop() {
 			return
 		}
 		s.messages = append(s.messages, msg)
+		s.counts[msg.Command()]++
+		s.last[msg.Command()] = msg
+		s.noteReceivedLocked(msg)
 		s.recordLocked("recv " + msg.Command())
 		handlers := append([]func(wire.Message) error{}, s.handlers[msg.Command()]...)
 		close(s.notify)
@@ -408,6 +546,36 @@ func (s *Session) connectionError() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cause
+}
+
+func (s *Session) commandCount(command string) (uint64, error, <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.counts[command], s.cause, s.notify
+}
+
+func (s *Session) noteSent(msg wire.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.noteSentLocked(msg)
+}
+
+func (s *Session) noteSentLocked(msg wire.Message) {
+	switch msg.Command() {
+	case wire.CmdVersion:
+		s.handshake.VersionSent = true
+	case wire.CmdVerAck:
+		s.handshake.VerAckSent = true
+	}
+}
+
+func (s *Session) noteReceivedLocked(msg wire.Message) {
+	switch msg.Command() {
+	case wire.CmdVersion:
+		s.handshake.VersionReceived = true
+	case wire.CmdVerAck:
+		s.handshake.VerAckReceived = true
+	}
 }
 
 func (s *Session) record(event string) {
