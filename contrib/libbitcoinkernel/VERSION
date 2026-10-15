@@ -1,0 +1,5 @@
+# Bitcoin Core source revision used by the experimental btcd kernel binding.
+BITCOIN_CORE_COMMIT=cce32b16874e85e8a00cfa1a2190f0b6f4dcaf66
+
+# SHA-256 of src/kernel/bitcoinkernel.h at BITCOIN_CORE_COMMIT.
+BITCOINKERNEL_HEADER_SHA256=da0014b49ce2d0915e8d7eb1d40566882c95f55c5eb4e5a65af177e4aa31dc19
