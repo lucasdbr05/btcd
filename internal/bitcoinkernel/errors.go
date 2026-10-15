@@ -57,4 +57,16 @@ var (
 
 	// ErrClosed indicates an operation on a closed kernel.
 	ErrClosed = errors.New("libbitcoinkernel is closed")
+
+	// ErrEmptyBlock indicates that no serialized block was supplied.
+	ErrEmptyBlock = errors.New("empty serialized block")
+
+	// ErrCreateBlock indicates that the serialized block could not be parsed
+	// by libbitcoinkernel.
+	ErrCreateBlock = errors.New("unable to create libbitcoinkernel block")
+
+	// ErrProcessBlock indicates an operational failure while asking the
+	// kernel to process a block.  Consensus rejection is represented by a
+	// successful call with ValidationInvalid in the returned BlockResult.
+	ErrProcessBlock = errors.New("unable to process block with libbitcoinkernel")
 )

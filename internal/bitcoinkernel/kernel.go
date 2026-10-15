@@ -5,6 +5,7 @@ package bitcoinkernel
 import "sync"
 
 type kernelBackend interface {
+	processBlock([]byte) (BlockResult, error)
 	interrupt() error
 	close() error
 }
@@ -14,8 +15,9 @@ type kernelBackend interface {
 // Callers must call Close when the kernel is no longer needed.  Kernel is safe
 // to close concurrently and Close is idempotent.
 type Kernel struct {
-	mu      sync.Mutex
-	backend kernelBackend
+	mu        sync.RWMutex
+	processMu sync.Mutex
+	backend   kernelBackend
 }
 
 // Open creates a kernel context for the configured chain.
@@ -51,14 +53,39 @@ func (k *Kernel) Close() error {
 	return err
 }
 
+// ProcessBlock parses, stores, and validates a serialized block.  A consensus
+// rejection is returned in BlockResult and is not an operational error.
+// Calls are serialized because libbitcoinkernel reports validation results
+// through a context callback associated with the block hash.
+func (k *Kernel) ProcessBlock(rawBlock []byte) (BlockResult, error) {
+	if k == nil {
+		return BlockResult{}, ErrClosed
+	}
+	if len(rawBlock) == 0 {
+		return BlockResult{}, ErrEmptyBlock
+	}
+
+	k.processMu.Lock()
+	defer k.processMu.Unlock()
+
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
+	if k.backend == nil {
+		return BlockResult{}, ErrClosed
+	}
+
+	return k.backend.processBlock(rawBlock)
+}
+
 // Interrupt requests cancellation of long-running kernel operations.
 func (k *Kernel) Interrupt() error {
 	if k == nil {
 		return ErrClosed
 	}
 
-	k.mu.Lock()
-	defer k.mu.Unlock()
+	k.mu.RLock()
+	defer k.mu.RUnlock()
 
 	if k.backend == nil {
 		return ErrClosed

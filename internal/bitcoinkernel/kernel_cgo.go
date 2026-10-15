@@ -10,6 +10,7 @@ package bitcoinkernel
 import "C"
 
 import (
+	"runtime"
 	"runtime/cgo"
 	"unsafe"
 )
@@ -152,6 +153,57 @@ func nativeChain(chain Chain) C.btck_ChainType {
 		// Config validation prevents this path.
 		panic("unsupported libbitcoinkernel chain")
 	}
+}
+
+func (b *nativeKernelBackend) processBlock(rawBlock []byte) (BlockResult, error) {
+	if b.context == nil || b.manager == nil {
+		return BlockResult{}, ErrClosed
+	}
+
+	block := C.btck_block_create(
+		unsafe.Pointer(unsafe.SliceData(rawBlock)), C.size_t(len(rawBlock)),
+	)
+	runtime.KeepAlive(rawBlock)
+	if block == nil {
+		return BlockResult{}, ErrCreateBlock
+	}
+	defer C.btck_block_destroy(block)
+
+	hash := nativeBlockHash(block)
+	resultReady := b.callbacks.expectBlock(hash)
+	defer b.callbacks.stopExpectingBlock(hash)
+
+	var newBlock C.int
+	processStatus := C.btck_chainstate_manager_process_block(
+		b.manager, block, &newBlock,
+	)
+	if processStatus != 0 {
+		// ProcessNewBlock also reports consensus-invalid blocks through its
+		// return code.  Prefer the detailed block_checked result whenever it
+		// was emitted; absence of that callback indicates an operational
+		// failure in the native call.
+		select {
+		case result := <-resultReady:
+			result.NewBlock = newBlock != 0
+			return result, nil
+		default:
+			return BlockResult{Hash: hash}, ErrProcessBlock
+		}
+	}
+
+	if newBlock == 0 {
+		select {
+		case result := <-resultReady:
+			result.NewBlock = false
+			return result, nil
+		default:
+			return BlockResult{Hash: hash}, nil
+		}
+	}
+
+	result := <-resultReady
+	result.NewBlock = true
+	return result, nil
 }
 
 func (b *nativeKernelBackend) interrupt() error {

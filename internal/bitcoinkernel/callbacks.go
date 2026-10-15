@@ -32,9 +32,19 @@ const (
 	BlockResultHeaderLowWork
 )
 
-// BlockResult is a copied Go representation of a block_checked callback.
+// BlockResult summarizes a block submission and any block_checked callback.
 type BlockResult struct {
-	Hash   [32]byte
+	Hash [32]byte
+
+	// Checked reports whether the kernel emitted a block_checked result.
+	// Duplicate blocks are accepted by ProcessBlock without necessarily
+	// producing that callback.
+	Checked bool
+
+	// NewBlock reports the value returned through libbitcoinkernel's
+	// new_block output parameter.
+	NewBlock bool
+
 	Mode   ValidationMode
 	Reason BlockValidationResult
 }
@@ -64,6 +74,7 @@ type callbackState struct {
 	flushError      string
 	fatalError      string
 	chainEventReady chan struct{}
+	pendingBlocks   map[[32]byte]chan BlockResult
 
 	destroyedHandles atomic.Uint32
 }
@@ -71,6 +82,7 @@ type callbackState struct {
 func newCallbackState() *callbackState {
 	return &callbackState{
 		chainEventReady: make(chan struct{}, 1),
+		pendingBlocks:   make(map[[32]byte]chan BlockResult),
 	}
 }
 
@@ -78,7 +90,32 @@ func (s *callbackState) recordBlockResult(result BlockResult) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	result.Checked = true
 	s.lastBlockResult = &result
+
+	pending := s.pendingBlocks[result.Hash]
+	if pending != nil {
+		select {
+		case pending <- result:
+		default:
+		}
+	}
+}
+
+func (s *callbackState) expectBlock(hash [32]byte) chan BlockResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result := make(chan BlockResult, 1)
+	s.pendingBlocks[hash] = result
+	return result
+}
+
+func (s *callbackState) stopExpectingBlock(hash [32]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.pendingBlocks, hash)
 }
 
 func (s *callbackState) recordChainEvent(event ChainEvent) {

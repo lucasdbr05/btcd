@@ -3,9 +3,17 @@
 package bitcoinkernel
 
 import (
+	"bytes"
+	"errors"
+	"math"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/btcsuite/btcd/blockchain"
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 )
 
 func TestKernelLifecycle(t *testing.T) {
@@ -71,6 +79,121 @@ func TestKernelInterrupt(t *testing.T) {
 	if err := kernel.Interrupt(); err != nil {
 		t.Fatalf("unable to interrupt kernel: %v", err)
 	}
+}
+
+func TestProcessBlock(t *testing.T) {
+	kernel, err := Open(testConfig(t, Regtest))
+	if err != nil {
+		t.Fatalf("unable to open kernel: %v", err)
+	}
+	defer kernel.Close()
+
+	rawBlock, wantHash := makeRegtestBlock(t, 50*1e8)
+	result, err := kernel.ProcessBlock(rawBlock)
+	if err != nil {
+		t.Fatalf("unable to process block: %v", err)
+	}
+	if !result.Checked {
+		t.Fatal("new block did not produce a validation result")
+	}
+	if result.Mode != ValidationValid || result.Reason != BlockResultUnset {
+		t.Fatalf("unexpected validation result: %+v", result)
+	}
+	if !result.NewBlock {
+		t.Fatal("first block submission was reported as a duplicate")
+	}
+	if result.Hash != wantHash {
+		t.Fatalf("unexpected block hash: got %x, want %x", result.Hash,
+			wantHash)
+	}
+
+	duplicate, err := kernel.ProcessBlock(rawBlock)
+	if err != nil {
+		t.Fatalf("unable to process duplicate block: %v", err)
+	}
+	if duplicate.NewBlock {
+		t.Fatal("duplicate block was reported as new")
+	}
+	if duplicate.Hash != wantHash {
+		t.Fatalf("unexpected duplicate hash: got %x, want %x",
+			duplicate.Hash, wantHash)
+	}
+}
+
+func TestProcessBlockConsensusRejection(t *testing.T) {
+	kernel, err := Open(testConfig(t, Regtest))
+	if err != nil {
+		t.Fatalf("unable to open kernel: %v", err)
+	}
+	defer kernel.Close()
+
+	rawBlock, wantHash := makeRegtestBlock(t, 50*1e8+1)
+	result, err := kernel.ProcessBlock(rawBlock)
+	if err != nil {
+		t.Fatalf("consensus rejection returned an operational error: %v", err)
+	}
+	if !result.Checked {
+		t.Fatal("invalid block did not produce a validation result")
+	}
+	if result.Hash != wantHash {
+		t.Fatalf("unexpected rejected block hash: got %x, want %x",
+			result.Hash, wantHash)
+	}
+	if result.Mode != ValidationInvalid ||
+		result.Reason != BlockResultConsensus {
+
+		t.Fatalf("unexpected consensus rejection: %+v", result)
+	}
+}
+
+func TestProcessBlockRejectsMalformedSerialization(t *testing.T) {
+	kernel, err := Open(testConfig(t, Regtest))
+	if err != nil {
+		t.Fatalf("unable to open kernel: %v", err)
+	}
+	defer kernel.Close()
+
+	_, err = kernel.ProcessBlock([]byte{0x00})
+	if !errors.Is(err, ErrCreateBlock) {
+		t.Fatalf("unexpected error: got %v, want %v", err, ErrCreateBlock)
+	}
+}
+
+func makeRegtestBlock(t *testing.T, coinbaseValue int64) ([]byte, [32]byte) {
+	t.Helper()
+
+	coinbase := wire.NewMsgTx(1)
+	coinbase.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+		Hash:  chainhash.Hash{},
+		Index: math.MaxUint32,
+	}, []byte{0x51, 0x00}, nil))
+	coinbase.AddTxOut(wire.NewTxOut(coinbaseValue, []byte{0x51}))
+	merkleRoot := coinbase.TxHash()
+
+	params := &chaincfg.RegressionNetParams
+	header := wire.NewBlockHeader(
+		4, params.GenesisHash, &merkleRoot, params.PowLimitBits, 0,
+	)
+	header.Timestamp = time.Unix(time.Now().Unix(), 0)
+	for {
+		hash := header.BlockHash()
+		if blockchain.HashToBig(&hash).Cmp(params.PowLimit) <= 0 {
+			break
+		}
+		header.Nonce++
+	}
+
+	block := wire.NewMsgBlock(header)
+	if err := block.AddTransaction(coinbase); err != nil {
+		t.Fatalf("unable to add coinbase transaction: %v", err)
+	}
+
+	var serialized bytes.Buffer
+	if err := block.Serialize(&serialized); err != nil {
+		t.Fatalf("unable to serialize block: %v", err)
+	}
+	hash := block.BlockHash()
+	return serialized.Bytes(), [32]byte(hash)
 }
 
 func assertDirectoryExists(t *testing.T, path string) {
