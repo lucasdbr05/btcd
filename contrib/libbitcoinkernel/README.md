@@ -125,9 +125,11 @@ Enable the native lifecycle binding explicitly with the build tag:
 CGO_ENABLED=1 go test -tags=libbitcoinkernel ./internal/bitcoinkernel
 ```
 
-The tagged test creates and destroys a kernel context for every supported
-Bitcoin network.  `PKG_CONFIG_PATH` and the platform runtime lookup variable
-must be configured as described above.
+The tagged test creates and destroys a kernel context and chainstate manager
+for every supported Bitcoin network.  It also verifies callback handle
+ownership and the manager's directory, worker, and cache configuration.
+`PKG_CONFIG_PATH` and the platform runtime lookup variable must be configured
+as described above.
 
 ## Runtime lookup
 
