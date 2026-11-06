@@ -206,6 +206,18 @@ func (b *nativeKernelBackend) processBlock(rawBlock []byte) (BlockResult, error)
 	return result, nil
 }
 
+func (b *nativeKernelBackend) drainChainEvents() []ChainEvent {
+	return b.callbacks.drainChainEvents()
+}
+
+func (b *nativeKernelBackend) drainErrorEvents() []ErrorEvent {
+	return b.callbacks.drainErrorEvents()
+}
+
+func (b *nativeKernelBackend) bestTip() (ChainEvent, bool) {
+	return b.callbacks.bestTip()
+}
+
 func (b *nativeKernelBackend) interrupt() error {
 	if b.context == nil {
 		return ErrClosed

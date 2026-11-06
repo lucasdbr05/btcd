@@ -31,6 +31,7 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/connmgr"
 	"github.com/btcsuite/btcd/database"
+	"github.com/btcsuite/btcd/internal/bitcoinkernel"
 	"github.com/btcsuite/btcd/internal/inbound"
 	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/mining"
@@ -280,6 +281,7 @@ type server struct {
 	rpcServer            *rpcServer
 	syncManager          *netsync.SyncManager
 	chain                *blockchain.BlockChain
+	kernel               *bitcoinkernel.Kernel
 	txMemPool            *mempool.TxPool
 	cpuMiner             *cpuminer.CPUMiner
 	modifyRebroadcastInv chan interface{}
@@ -2554,6 +2556,11 @@ out:
 	s.connManager.Stop()
 	s.syncManager.Stop()
 	s.addrManager.Stop()
+	if s.kernel != nil {
+		if err := s.kernel.Close(); err != nil {
+			srvrLog.Errorf("Unable to close libbitcoinkernel: %v", err)
+		}
+	}
 
 	// Drain channels before exiting so nothing is left waiting around
 	// to send.
@@ -3031,6 +3038,22 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		agentWhitelist:       agentWhitelist,
 	}
 
+	if cfg.LibBitcoinKernel {
+		kernel, err := openConsensusKernel(chainParams)
+		if err != nil {
+			return nil, err
+		}
+		s.kernel = kernel
+	}
+	closeKernelOnError := true
+	defer func() {
+		if closeKernelOnError && s.kernel != nil {
+			if err := s.kernel.Close(); err != nil {
+				srvrLog.Errorf("Unable to close libbitcoinkernel: %v", err)
+			}
+		}
+	}()
+
 	// Create the transaction and address indexes if needed.
 	//
 	// CAUTION: the txindex needs to be first in the indexes array because
@@ -3081,6 +3104,11 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	}
 
 	// Create a new block chain instance with the appropriate configuration.
+	shadowValidator := newKernelShadowValidator(s.kernel)
+	var blockValidator blockchain.BlockValidator
+	if shadowValidator != nil {
+		blockValidator = shadowValidator
+	}
 	var err error
 	s.chain, err = blockchain.New(&blockchain.Config{
 		DB:               s.db,
@@ -3093,9 +3121,18 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		HashCache:        s.hashCache,
 		Prune:            cfg.Prune * 1024 * 1024,
 		UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+		BlockValidator:   blockValidator,
 	})
 	if err != nil {
 		return nil, err
+	}
+	if err := bootstrapConsensusKernel(s.kernel, s.chain); err != nil {
+		return nil, err
+	}
+	if shadowValidator != nil {
+		s.chain.Subscribe(func(notification *blockchain.Notification) {
+			shadowValidator.ObserveBlockChainNotification(s.chain, notification)
+		})
 	}
 
 	// Search for a FeeEstimator state in the database. If none can be found
@@ -3336,6 +3373,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		}()
 	}
 
+	closeKernelOnError = false
 	return &s, nil
 }
 

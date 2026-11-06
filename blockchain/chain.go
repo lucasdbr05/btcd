@@ -193,6 +193,10 @@ type BlockChain struct {
 	// certain blockchain events.
 	notificationsLock sync.RWMutex
 	notifications     []NotificationCallback
+
+	// blockValidator optionally observes submitted blocks before btcd's own
+	// validation path.  Its result is never used for consensus decisions.
+	blockValidator BlockValidator
 }
 
 // HaveBlock returns whether or not the chain instance has the block data
@@ -2213,6 +2217,21 @@ type Config struct {
 	// will target for with block files.  Prune at 0 specifies that no
 	// blocks will be deleted.
 	Prune uint64
+
+	// BlockValidator observes every block submitted to ProcessBlock before
+	// btcd applies its own validation.  It is intentionally observational:
+	// implementations must not affect block acceptance or rejection.
+	//
+	// This field can be nil when no external validator is required.
+	BlockValidator BlockValidator
+}
+
+// BlockValidator observes blocks submitted to ProcessBlock.  It is intended
+// for shadow validation by an independent consensus implementation.  The
+// BlockChain deliberately ignores an implementation's result so that the btcd
+// consensus engine remains authoritative.
+type BlockValidator interface {
+	ValidateBlock(block *btcutil.Block)
 }
 
 // New returns a BlockChain instance using the provided configuration details.
@@ -2271,6 +2290,7 @@ func New(config *Config) (*BlockChain, error) {
 		warningCaches:       newThresholdCaches(vbNumBits),
 		deploymentCaches:    newThresholdCaches(chaincfg.DefinedDeployments),
 		pruneTarget:         config.Prune,
+		blockValidator:      config.BlockValidator,
 	}
 
 	// Ensure all the deployments are synchronized with our clock if

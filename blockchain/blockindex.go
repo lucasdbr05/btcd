@@ -408,6 +408,36 @@ func (bi *blockIndex) LookupNode(hash *chainhash.Hash) *blockNode {
 	return node
 }
 
+// blockHashesWithData returns the hashes for all blocks whose payload is
+// stored, ordered so that every block appears after its parent.
+//
+// This function is safe for concurrent access.
+func (bi *blockIndex) blockHashesWithData() []chainhash.Hash {
+	type indexedHash struct {
+		hash   chainhash.Hash
+		height int32
+	}
+
+	bi.RLock()
+	blocks := make([]indexedHash, 0, len(bi.index))
+	for hash, node := range bi.index {
+		if node.status.HaveData() {
+			blocks = append(blocks, indexedHash{hash: hash, height: node.height})
+		}
+	}
+	bi.RUnlock()
+
+	sort.Slice(blocks, func(i, j int) bool {
+		return blocks[i].height < blocks[j].height
+	})
+
+	hashes := make([]chainhash.Hash, len(blocks))
+	for i := range blocks {
+		hashes[i] = blocks[i].hash
+	}
+	return hashes
+}
+
 // AddNode adds the provided node to the block index and marks it as dirty.
 // Duplicate entries are not checked so it is up to caller to avoid adding them.
 //

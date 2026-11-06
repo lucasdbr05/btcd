@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/internal/bitcoinkernel"
 	"github.com/btcsuite/btcd/internal/inbound"
 	"github.com/btcsuite/btcd/peer"
 	"github.com/stretchr/testify/assert"
@@ -38,6 +39,38 @@ func newTestServerPeer(t *testing.T) (*server, *serverPeer) {
 	})
 
 	return s, sp
+}
+
+func TestKernelShadowValidatorDisabled(t *testing.T) {
+	t.Parallel()
+
+	// Keep the disabled configuration as a nil interface. A typed nil would
+	// make BlockChain attempt to invoke the validator in ordinary builds.
+	require.Nil(t, newKernelShadowValidator(nil))
+}
+
+func TestKernelChain(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		params *chaincfg.Params
+		want   bitcoinkernel.Chain
+	}{
+		{&chaincfg.MainNetParams, bitcoinkernel.Mainnet},
+		{&chaincfg.TestNet3Params, bitcoinkernel.Testnet},
+		{&chaincfg.TestNet4Params, bitcoinkernel.Testnet4},
+		{&chaincfg.SigNetParams, bitcoinkernel.Signet},
+		{&chaincfg.RegressionNetParams, bitcoinkernel.Regtest},
+	}
+
+	for _, test := range tests {
+		got, err := kernelChain(test.params)
+		require.NoError(t, err)
+		require.Equal(t, test.want, got)
+	}
+
+	_, err := kernelChain(&chaincfg.SimNetParams)
+	require.Error(t, err)
 }
 
 // recvLifecycleEvent reads a single event from the peerLifecycle

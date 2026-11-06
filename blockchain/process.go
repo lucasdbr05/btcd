@@ -115,6 +115,13 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 			b.removeOrphanBlock(orphan)
 			i--
 
+			// The block was previously observed while its parent was
+			// unavailable. Submit it to an external shadow validator again now
+			// that it can perform context-dependent validation.
+			if b.blockValidator != nil {
+				b.blockValidator.ValidateBlock(orphan.block)
+			}
+
 			// Potentially accept the block into the block chain.
 			_, err := b.maybeAcceptBlock(orphan.block, flags)
 			if err != nil {
@@ -143,6 +150,13 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bool, bool, error) {
 	b.chainLock.Lock()
 	defer b.chainLock.Unlock()
+
+	// An external validator is a shadow observer only.  In particular, a
+	// failure or disagreement must not change the established btcd consensus
+	// path below.
+	if b.blockValidator != nil {
+		b.blockValidator.ValidateBlock(block)
+	}
 
 	fastAdd := flags&BFFastAdd == BFFastAdd
 

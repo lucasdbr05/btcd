@@ -9,7 +9,98 @@ import (
 
 	"github.com/btcsuite/btcd/blockchain/internal/testhelper"
 	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 )
+
+type recordingBlockValidator struct {
+	blocks []*btcutil.Block
+}
+
+func (v *recordingBlockValidator) ValidateBlock(block *btcutil.Block) {
+	v.blocks = append(v.blocks, block)
+}
+
+func TestProcessBlockNotifiesShadowValidator(t *testing.T) {
+	chain, teardown, err := chainSetup("shadowvalidator",
+		&chaincfg.RegressionNetParams)
+	if err != nil {
+		t.Fatalf("unable to set up chain: %v", err)
+	}
+	defer teardown()
+
+	validator := &recordingBlockValidator{}
+	chain.blockValidator = validator
+
+	genesis := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+	genesis.SetHeight(0)
+	block, _, err := newBlock(chain, genesis, nil)
+	if err != nil {
+		t.Fatalf("unable to create block: %v", err)
+	}
+
+	isMainChain, isOrphan, err := chain.ProcessBlock(block, BFNone)
+	if err != nil {
+		t.Fatalf("unable to process block: %v", err)
+	}
+	if !isMainChain || isOrphan {
+		t.Fatalf("unexpected ProcessBlock result: main=%v orphan=%v",
+			isMainChain, isOrphan)
+	}
+	if len(validator.blocks) != 1 || validator.blocks[0] != block {
+		t.Fatal("shadow validator did not receive the submitted block")
+	}
+
+	storedHashes := chain.StoredBlockHashes()
+	if len(storedHashes) != 2 || storedHashes[0] != *genesis.Hash() ||
+		storedHashes[1] != *block.Hash() {
+
+		t.Fatalf("unexpected stored block order: %v", storedHashes)
+	}
+	storedBlock, err := chain.StoredBlockByHash(block.Hash())
+	if err != nil || !storedBlock.Hash().IsEqual(block.Hash()) ||
+		storedBlock.Height() != 1 {
+
+		t.Fatalf("unable to retrieve stored block: block=%v err=%v", storedBlock, err)
+	}
+}
+
+func TestProcessOrphansRevalidatesWithShadowValidator(t *testing.T) {
+	chain, teardown, err := chainSetup("shadowvalidator-orphan",
+		&chaincfg.RegressionNetParams)
+	if err != nil {
+		t.Fatalf("unable to set up chain: %v", err)
+	}
+	defer teardown()
+
+	validator := &recordingBlockValidator{}
+	chain.blockValidator = validator
+
+	genesis := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+	genesis.SetHeight(0)
+	parent, _, err := newBlock(chain, genesis, nil)
+	if err != nil {
+		t.Fatalf("unable to create parent block: %v", err)
+	}
+	child, _, err := newBlock(chain, parent, nil)
+	if err != nil {
+		t.Fatalf("unable to create child block: %v", err)
+	}
+
+	_, isOrphan, err := chain.ProcessBlock(child, BFNone)
+	if err != nil || !isOrphan {
+		t.Fatalf("unexpected orphan result: orphan=%v err=%v", isOrphan, err)
+	}
+	_, isOrphan, err = chain.ProcessBlock(parent, BFNone)
+	if err != nil || isOrphan {
+		t.Fatalf("unexpected parent result: orphan=%v err=%v", isOrphan, err)
+	}
+
+	if len(validator.blocks) != 3 || validator.blocks[0] != child ||
+		validator.blocks[1] != parent || validator.blocks[2] != child {
+
+		t.Fatalf("unexpected shadow validation order: %+v", validator.blocks)
+	}
+}
 
 // TestMaybeAcceptBlockReusesHeaderNode ensures that when a block header is
 // processed first via ProcessBlockHeader and later the full block arrives via

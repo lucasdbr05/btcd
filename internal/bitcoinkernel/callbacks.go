@@ -66,13 +66,22 @@ type ChainEvent struct {
 	Height int32
 }
 
+// ErrorEvent reports an asynchronous error emitted by libbitcoinkernel.
+type ErrorEvent struct {
+	Fatal   bool
+	Message string
+}
+
 type callbackState struct {
 	mu sync.Mutex
 
 	lastBlockResult *BlockResult
 	lastChainEvent  *ChainEvent
+	lastChainTip    *ChainEvent
 	flushError      string
 	fatalError      string
+	chainEvents     []ChainEvent
+	errorEvents     []ErrorEvent
 	chainEventReady chan struct{}
 	pendingBlocks   map[[32]byte]chan BlockResult
 
@@ -123,6 +132,10 @@ func (s *callbackState) recordChainEvent(event ChainEvent) {
 	defer s.mu.Unlock()
 
 	s.lastChainEvent = &event
+	if event.Type == BlockTipUpdated {
+		s.lastChainTip = &event
+	}
+	s.chainEvents = append(s.chainEvents, event)
 	select {
 	case s.chainEventReady <- struct{}{}:
 	default:
@@ -134,6 +147,7 @@ func (s *callbackState) recordFlushError(message string) {
 	defer s.mu.Unlock()
 
 	s.flushError = message
+	s.errorEvents = append(s.errorEvents, ErrorEvent{Message: message})
 }
 
 func (s *callbackState) recordFatalError(message string) {
@@ -141,4 +155,37 @@ func (s *callbackState) recordFatalError(message string) {
 	defer s.mu.Unlock()
 
 	s.fatalError = message
+	s.errorEvents = append(s.errorEvents, ErrorEvent{
+		Fatal:   true,
+		Message: message,
+	})
+}
+
+func (s *callbackState) drainChainEvents() []ChainEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	events := s.chainEvents
+	s.chainEvents = nil
+	return events
+}
+
+func (s *callbackState) drainErrorEvents() []ErrorEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	events := s.errorEvents
+	s.errorEvents = nil
+	return events
+}
+
+func (s *callbackState) bestTip() (ChainEvent, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.lastChainTip == nil {
+		return ChainEvent{}, false
+	}
+
+	return *s.lastChainTip, true
 }

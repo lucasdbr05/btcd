@@ -1511,3 +1511,32 @@ func (b *BlockChain) BlockByHash(hash *chainhash.Hash) (*btcutil.Block, error) {
 	})
 	return block, err
 }
+
+// StoredBlockHashes returns every block whose payload is stored by the node.
+// The hashes are ordered so that each block follows its parent. Blocks on side
+// chains and blocks later marked invalid are included.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) StoredBlockHashes() []chainhash.Hash {
+	return b.index.blockHashesWithData()
+}
+
+// StoredBlockByHash returns a stored block regardless of whether it belongs to
+// the current main chain. The returned block has its known index height set.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) StoredBlockByHash(hash *chainhash.Hash) (*btcutil.Block, error) {
+	node := b.index.LookupNode(hash)
+	if node == nil || !b.index.NodeStatus(node).HaveData() {
+		str := fmt.Sprintf("no stored block with hash %s exists", hash)
+		return nil, errNotInMainChain(str)
+	}
+
+	var block *btcutil.Block
+	err := b.db.View(func(dbTx database.Tx) error {
+		var err error
+		block, err = dbFetchBlockByNode(dbTx, node)
+		return err
+	})
+	return block, err
+}

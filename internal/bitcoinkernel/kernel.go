@@ -6,6 +6,9 @@ import "sync"
 
 type kernelBackend interface {
 	processBlock([]byte) (BlockResult, error)
+	drainChainEvents() []ChainEvent
+	drainErrorEvents() []ErrorEvent
+	bestTip() (ChainEvent, bool)
 	interrupt() error
 	close() error
 }
@@ -76,6 +79,59 @@ func (k *Kernel) ProcessBlock(rawBlock []byte) (BlockResult, error) {
 	}
 
 	return k.backend.processBlock(rawBlock)
+}
+
+// DrainChainEvents returns and removes chain callbacks received since the
+// previous call. The returned values are copies owned by the caller.
+func (k *Kernel) DrainChainEvents() []ChainEvent {
+	if k == nil {
+		return nil
+	}
+
+	k.processMu.Lock()
+	defer k.processMu.Unlock()
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	if k.backend == nil {
+		return nil
+	}
+
+	return k.backend.drainChainEvents()
+}
+
+// DrainErrorEvents returns and removes asynchronous flush and fatal errors
+// reported by libbitcoinkernel since the previous call.
+func (k *Kernel) DrainErrorEvents() []ErrorEvent {
+	if k == nil {
+		return nil
+	}
+
+	k.processMu.Lock()
+	defer k.processMu.Unlock()
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	if k.backend == nil {
+		return nil
+	}
+
+	return k.backend.drainErrorEvents()
+}
+
+// BestTip returns the latest block_tip callback received from the kernel.
+func (k *Kernel) BestTip() (ChainEvent, bool) {
+	if k == nil {
+		return ChainEvent{}, false
+	}
+
+	k.processMu.Lock()
+	defer k.processMu.Unlock()
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	if k.backend == nil {
+		return ChainEvent{}, false
+	}
+
+	return k.backend.bestTip()
 }
 
 // Interrupt requests cancellation of long-running kernel operations.

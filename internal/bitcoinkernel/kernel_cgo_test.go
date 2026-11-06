@@ -49,6 +49,14 @@ func TestKernelLifecycle(t *testing.T) {
 				t.Fatalf("unexpected initial chain event: %+v",
 					initialChainEvent)
 			}
+			bestTip, ok := kernel.BestTip()
+			if !ok || bestTip != initialChainEvent {
+				t.Fatalf("unexpected reported best tip: ok=%v tip=%+v", ok,
+					bestTip)
+			}
+			if events := kernel.DrainChainEvents(); len(events) == 0 {
+				t.Fatal("initial chain callback was not exposed")
+			}
 			assertDirectoryExists(t, cfg.DataDir)
 			assertDirectoryExists(t, cfg.BlocksDir)
 

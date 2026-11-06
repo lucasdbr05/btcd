@@ -137,6 +137,7 @@ type config struct {
 	FreeTxRelayLimit     float64       `long:"limitfreerelay" description:"Limit relay of transactions with no transaction fee to the given amount in thousands of bytes per minute"`
 	Listeners            []string      `long:"listen" description:"Add an interface/port to listen for connections (default all interfaces port: 8333, testnet: 18333)"`
 	LogDir               string        `long:"logdir" description:"Directory to log output."`
+	LibBitcoinKernel     bool          `long:"libbitcoinkernel" description:"Enable experimental libbitcoinkernel consensus shadow validation"`
 	MaxOrphanTxs         int           `long:"maxorphantx" description:"Max number of orphan transactions to keep in memory"`
 	MaxPeers             int           `long:"maxpeers" description:"Max number of inbound and outbound peers. Must be greater than zero. Outbound slots for the configured peer mode are reserved before inbound capacity is calculated"`
 	MiningAddrs          []string      `long:"miningaddr" description:"Add the specified payment address to the list of addresses to use for generated blocks -- At least one address is required if the generate option is set"`
