@@ -6,6 +6,7 @@ package blockchain
 
 import (
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/blockchain/internal/testhelper"
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -144,6 +145,32 @@ func TestProcessBlockReportsFinalValidationResult(t *testing.T) {
 	if err != nil || isOrphan {
 		t.Fatalf("unexpected parent result: orphan=%v err=%v", isOrphan, err)
 	}
+
+	// A competing block remains on a side chain until its child makes that
+	// branch the best chain, exercising both dispositions around a reorg.
+	sideBlock, _, err := newBlock(chain, parent, nil)
+	if err != nil {
+		t.Fatalf("unable to create side-chain block: %v", err)
+	}
+	sideBlock.MsgBlock().Header.Timestamp = sideBlock.MsgBlock().Header.Timestamp.Add(time.Second)
+	if !testhelper.SolveBlock(&sideBlock.MsgBlock().Header) {
+		t.Fatal("unable to solve side-chain block")
+	}
+	isMainChain, isOrphan, err := chain.ProcessBlock(sideBlock, BFNone)
+	if err != nil || isMainChain || isOrphan {
+		t.Fatalf("unexpected side-chain result: main=%v orphan=%v err=%v",
+			isMainChain, isOrphan, err)
+	}
+	sideTip, _, err := newBlock(chain, sideBlock, nil)
+	if err != nil {
+		t.Fatalf("unable to create reorganization tip: %v", err)
+	}
+	isMainChain, isOrphan, err = chain.ProcessBlock(sideTip, BFNone)
+	if err != nil || !isMainChain || isOrphan {
+		t.Fatalf("unexpected reorganization result: main=%v orphan=%v err=%v",
+			isMainChain, isOrphan, err)
+	}
+
 	_, _, err = chain.ProcessBlock(parent, BFNone)
 	if err == nil {
 		t.Fatal("expected duplicate-block error")
@@ -155,12 +182,14 @@ func TestProcessBlockReportsFinalValidationResult(t *testing.T) {
 		t.Fatal("expected invalid-block error")
 	}
 
-	if len(validator.results) != 5 {
-		t.Fatalf("unexpected result count: got %d, want 5", len(validator.results))
+	if len(validator.results) != 7 {
+		t.Fatalf("unexpected result count: got %d, want 7", len(validator.results))
 	}
 	wantOutcomes := []BlockValidationOutcome{
 		BlockOrphaned,
 		BlockAcceptedMainChain,
+		BlockAcceptedMainChain,
+		BlockAcceptedSideChain,
 		BlockAcceptedMainChain,
 		BlockDuplicate,
 		BlockRejected,
@@ -170,12 +199,12 @@ func TestProcessBlockReportsFinalValidationResult(t *testing.T) {
 			t.Errorf("result %d: got %s, want %s", i, got, want)
 		}
 	}
-	if got := validator.results[3].RuleError; got == nil ||
+	if got := validator.results[5].RuleError; got == nil ||
 		got.ErrorCode != ErrDuplicateBlock {
 
 		t.Errorf("duplicate result has unexpected rule error: %+v", got)
 	}
-	if validator.results[4].RuleError == nil {
+	if validator.results[6].RuleError == nil {
 		t.Error("rejection result does not include its rule error")
 	}
 }

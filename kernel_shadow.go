@@ -22,6 +22,7 @@ type kernelShadowValidator struct {
 	kernel *bitcoinkernel.Kernel
 
 	mu                 sync.Mutex
+	chain              *blockchain.BlockChain
 	pendingTransitions []bitcoinkernel.ChainEvent
 	nativeTip          *bitcoinkernel.ChainEvent
 	nativeResults      map[[32]byte]nativeBlockResult
@@ -49,7 +50,25 @@ func newKernelShadowValidator(kernel *bitcoinkernel.Kernel) *kernelShadowValidat
 	}
 }
 
+// SetChain supplies the btcd chain used to add best-tip context to shadow
+// validation diagnostics. It is called once during server initialization.
+func (v *kernelShadowValidator) SetChain(chain *blockchain.BlockChain) {
+	if v == nil {
+		return
+	}
+
+	v.mu.Lock()
+	v.chain = chain
+	v.mu.Unlock()
+}
+
 func (v *kernelShadowValidator) ValidateBlock(block *btcutil.Block) {
+	// A btcd ProcessBlock call synchronously emits all of its main-chain
+	// notifications before the next block reaches this observer. Anything
+	// remaining here therefore denotes a kernel-only transition.
+	v.collectCallbacks()
+	v.reportPendingTransitions(block)
+
 	rawBlock, err := block.Bytes()
 	if err != nil {
 		srvrLog.Errorf("libbitcoinkernel could not serialize block %v: %v",
@@ -129,16 +148,18 @@ func (v *kernelShadowValidator) ObserveBlockValidationResult(
 	}
 
 	btcdReason := ""
+	btcdCode := ""
 	if btcdResult.RuleError != nil {
-		btcdReason = fmt.Sprintf(" code=%s reason=%q",
-			btcdResult.RuleError.ErrorCode, btcdResult.RuleError.Description)
+		btcdCode = btcdResult.RuleError.ErrorCode.String()
+		btcdReason = btcdResult.RuleError.Description
 	} else if btcdResult.ProcessError != nil {
-		btcdReason = fmt.Sprintf(" error=%q", btcdResult.ProcessError)
+		btcdReason = btcdResult.ProcessError.Error()
 	}
-	srvrLog.Warnf("libbitcoinkernel consensus divergence for block %v: "+
-		"btcd=%s%s kernel-mode=%d kernel-reason=%d checked=%t new=%t",
-		block.Hash(), btcdResult.Outcome, btcdReason, native.result.Mode,
-		native.result.Reason, native.result.Checked, native.result.NewBlock)
+	v.logDivergence("block-validation", block.Hash().String(), block.Height(),
+		"btcd_outcome=%s btcd_code=%q btcd_reason=%q kernel_checked=%t "+
+			"kernel_new_block=%t kernel_mode=%d kernel_reason=%d",
+		btcdResult.Outcome, btcdCode, btcdReason, native.result.Checked,
+		native.result.NewBlock, native.result.Mode, native.result.Reason)
 }
 
 func (v *kernelShadowValidator) storeNativeResult(hash [32]byte, result nativeBlockResult) {
@@ -210,48 +231,109 @@ func (v *kernelShadowValidator) ObserveBlockChainNotification(
 	}
 
 	v.collectCallbacks()
-	hash := [32]byte(*block.Hash())
-	height := block.Height()
-
-	v.mu.Lock()
-	matched := false
-	for i, event := range v.pendingTransitions {
-		if event.Type != expected {
-			continue
-		}
-		if event.Hash == hash && event.Height == height {
-			copy(v.pendingTransitions[i:], v.pendingTransitions[i+1:])
-			v.pendingTransitions[len(v.pendingTransitions)-1] = bitcoinkernel.ChainEvent{}
-			v.pendingTransitions = v.pendingTransitions[:len(v.pendingTransitions)-1]
-			matched = true
-			break
-		}
+	expectedEvent := bitcoinkernel.ChainEvent{
+		Type:   expected,
+		Hash:   [32]byte(*block.Hash()),
+		Height: block.Height(),
 	}
-	pending := len(v.pendingTransitions)
-	var nativeTip *bitcoinkernel.ChainEvent
-	if v.nativeTip != nil {
-		tip := *v.nativeTip
-		nativeTip = &tip
-	}
-	v.mu.Unlock()
-
+	nativeEvent, matched, pending := v.consumeTransition(expectedEvent)
 	if !matched {
-		srvrLog.Warnf("libbitcoinkernel did not report btcd's %s block %v at height %d",
-			notification.Type, block.Hash(), height)
+		if nativeEvent == nil {
+			v.logDivergence("missing-kernel-transition", block.Hash().String(),
+				block.Height(), "btcd_transition=%s", notification.Type)
+		} else {
+			v.logDivergence("transition-order", block.Hash().String(), block.Height(),
+				"btcd_transition=%s kernel_transition=%d kernel_hash=%x "+
+					"kernel_height=%d", notification.Type, nativeEvent.Type,
+				nativeEvent.Hash, nativeEvent.Height)
+		}
 		return
 	}
-	if pending != 0 || nativeTip == nil {
+	if pending != 0 {
 		// A reorganization can contain several transitions. Compare the tip
 		// only after both implementations have completed that sequence.
 		return
 	}
 
+	nativeTip := v.bestNativeTip()
+	if nativeTip == nil {
+		v.logDivergence("missing-kernel-tip", block.Hash().String(), block.Height(),
+			"btcd_transition=%s", notification.Type)
+		return
+	}
 	best := chain.BestSnapshot()
 	if nativeTip.Hash != [32]byte(best.Hash) || nativeTip.Height != best.Height {
-		srvrLog.Warnf("libbitcoinkernel tip differs from btcd after %s: "+
-			"kernel=%x@%d btcd=%v@%d", notification.Type, nativeTip.Hash,
-			nativeTip.Height, best.Hash, best.Height)
+		v.logDivergence("chain-tip", block.Hash().String(), block.Height(),
+			"btcd_transition=%s kernel_tip_hash=%x kernel_tip_height=%d "+
+				"btcd_tip_hash=%v btcd_tip_height=%d", notification.Type,
+			nativeTip.Hash, nativeTip.Height, best.Hash, best.Height)
 	}
+}
+
+// consumeTransition removes the next kernel transition and verifies that it is
+// exactly the transition btcd reported. A strict FIFO comparison detects both
+// missing and reordered steps in reorganizations.
+func (v *kernelShadowValidator) consumeTransition(expected bitcoinkernel.ChainEvent) (
+	*bitcoinkernel.ChainEvent, bool, int,
+) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if len(v.pendingTransitions) == 0 {
+		return nil, false, 0
+	}
+
+	actual := v.pendingTransitions[0]
+	v.pendingTransitions[0] = bitcoinkernel.ChainEvent{}
+	v.pendingTransitions = v.pendingTransitions[1:]
+	return &actual, actual == expected, len(v.pendingTransitions)
+}
+
+func (v *kernelShadowValidator) bestNativeTip() *bitcoinkernel.ChainEvent {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.nativeTip == nil {
+		return nil
+	}
+	tip := *v.nativeTip
+	return &tip
+}
+
+// reportPendingTransitions clears and reports native transitions which btcd
+// did not report before the next block began processing. Clearing them lets a
+// later, independent sequence be compared without a cascading false match.
+func (v *kernelShadowValidator) reportPendingTransitions(block *btcutil.Block) {
+	v.mu.Lock()
+	pending := v.pendingTransitions
+	v.pendingTransitions = nil
+	v.mu.Unlock()
+
+	for _, event := range pending {
+		v.logDivergence("kernel-only-transition", block.Hash().String(),
+			block.Height(), "kernel_transition=%d kernel_hash=%x kernel_height=%d",
+			event.Type, event.Hash, event.Height)
+	}
+}
+
+func (v *kernelShadowValidator) logDivergence(kind, blockHash string,
+	blockHeight int32, format string, args ...interface{}) {
+
+	chainTipHash := ""
+	chainTipHeight := int32(-1)
+	v.mu.Lock()
+	chain := v.chain
+	v.mu.Unlock()
+	if chain != nil {
+		best := chain.BestSnapshot()
+		chainTipHash = best.Hash.String()
+		chainTipHeight = best.Height
+	}
+
+	detail := fmt.Sprintf(format, args...)
+	srvrLog.Warnf("libbitcoinkernel divergence kind=%s block_hash=%s "+
+		"block_height=%d chain_tip_hash=%s chain_tip_height=%d %s", kind,
+		blockHash, blockHeight, chainTipHash, chainTipHeight, detail)
 }
 
 func (v *kernelShadowValidator) collectCallbacks() {

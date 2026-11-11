@@ -3130,6 +3130,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		return nil, err
 	}
 	if shadowValidator != nil {
+		shadowValidator.SetChain(s.chain)
 		s.chain.Subscribe(func(notification *blockchain.Notification) {
 			shadowValidator.ObserveBlockChainNotification(s.chain, notification)
 		})

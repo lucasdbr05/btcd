@@ -122,6 +122,45 @@ func TestKernelShadowValidatorResultComparison(t *testing.T) {
 	}
 }
 
+func TestKernelShadowValidatorConsumesTransitionsInOrder(t *testing.T) {
+	t.Parallel()
+
+	disconnected := bitcoinkernel.ChainEvent{
+		Type:   bitcoinkernel.BlockDisconnected,
+		Hash:   [32]byte{1},
+		Height: 100,
+	}
+	connected := bitcoinkernel.ChainEvent{
+		Type:   bitcoinkernel.BlockConnected,
+		Hash:   [32]byte{2},
+		Height: 100,
+	}
+	validator := &kernelShadowValidator{
+		pendingTransitions: []bitcoinkernel.ChainEvent{disconnected, connected},
+	}
+
+	got, matched, pending := validator.consumeTransition(disconnected)
+	require.NotNil(t, got)
+	assert.True(t, matched)
+	assert.Equal(t, disconnected, *got)
+	assert.Equal(t, 1, pending)
+
+	got, matched, pending = validator.consumeTransition(connected)
+	require.NotNil(t, got)
+	assert.True(t, matched)
+	assert.Equal(t, connected, *got)
+	assert.Zero(t, pending)
+
+	// A matching event later in the native queue must not hide a missing or
+	// reordered earlier transition.
+	validator.pendingTransitions = []bitcoinkernel.ChainEvent{disconnected, connected}
+	got, matched, pending = validator.consumeTransition(connected)
+	require.NotNil(t, got)
+	assert.False(t, matched)
+	assert.Equal(t, disconnected, *got)
+	assert.Equal(t, 1, pending)
+}
+
 func TestKernelChain(t *testing.T) {
 	t.Parallel()
 
