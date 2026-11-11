@@ -74,6 +74,54 @@ cmake --install bitcoin-core/build-kernel \
   --component libbitcoinkernel
 ```
 
+### Reuse an existing Bitcoin Core checkout
+
+An existing local checkout will commonly be at a newer revision than the one
+recorded in [`VERSION`](VERSION). Do not build the binding from that checkout's
+current `HEAD`: the experimental C API is not versioned. Instead, preserve the
+checkout and create a detached worktree at the pinned revision. The following
+example uses absolute paths; adjust them for the local machine:
+
+```sh
+bitcoin_core=/absolute/path/to/bitcoin-core
+kernel_source=/absolute/path/to/bitcoin-core-kernel
+kernel_prefix=/absolute/path/to/bitcoin-kernel-install
+kernel_commit=$(sed -n 's/^BITCOIN_CORE_COMMIT=//p' contrib/libbitcoinkernel/VERSION)
+
+# Fetch only if the pinned object is not already present locally.
+git -C "$bitcoin_core" fetch origin master
+git -C "$bitcoin_core" worktree add --detach "$kernel_source" "$kernel_commit"
+```
+
+Then use `$kernel_source` in place of `bitcoin-core` in the CMake commands
+above. For example:
+
+```sh
+cmake -S "$kernel_source" -B "$kernel_source/build-kernel" \
+  -DCMAKE_INSTALL_PREFIX="$kernel_prefix" \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DBUILD_SHARED_LIBS=ON \
+  -DBUILD_BITCOIN_BIN=OFF \
+  -DBUILD_KERNEL_LIB=ON \
+  -DBUILD_KERNEL_TEST=OFF \
+  -DBUILD_UTIL_CHAINSTATE=OFF \
+  -DBUILD_BENCH=OFF \
+  -DBUILD_CLI=OFF \
+  -DBUILD_DAEMON=OFF \
+  -DBUILD_FUZZ_BINARY=OFF \
+  -DBUILD_GUI=OFF \
+  -DBUILD_GUI_TESTS=OFF \
+  -DBUILD_TESTS=OFF \
+  -DBUILD_TX=OFF \
+  -DBUILD_UTIL=OFF \
+  -DBUILD_WALLET_TOOL=OFF \
+  -DENABLE_IPC=OFF \
+  -DENABLE_WALLET=OFF
+
+cmake --build "$kernel_source/build-kernel" --target libbitcoinkernel --parallel
+cmake --install "$kernel_source/build-kernel" --component libbitcoinkernel
+```
+
 `CMAKE_INSTALL_PREFIX` must be set while configuring.  The generated
 `libbitcoinkernel.pc` records that configured prefix, so changing only the
 install command's `--prefix` option would leave pkg-config pointing at the
@@ -144,3 +192,41 @@ configuration until packaging or rpath handling is added:
 
 Static linking and distribution of native artifacts are intentionally outside
 this initial dependency setup.
+
+## Build and run btcd with the kernel
+
+From the btcd repository root, configure both the build-time `pkg-config`
+lookup and the runtime shared-library lookup. `pkg-config` must succeed before
+attempting a tagged Go build; an error that `libbitcoinkernel.pc` is not found
+usually means that `kernel_prefix` was not set or does not name the CMake
+installation prefix.
+
+```sh
+export PKG_CONFIG_PATH="$kernel_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+
+# Linux:
+export LD_LIBRARY_PATH="$kernel_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# macOS (use this instead of LD_LIBRARY_PATH):
+export DYLD_LIBRARY_PATH="$kernel_prefix/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+
+pkg-config --modversion libbitcoinkernel
+contrib/libbitcoinkernel/verify-install.sh
+CGO_ENABLED=1 go test -tags=libbitcoinkernel ./internal/bitcoinkernel
+go build -tags=libbitcoinkernel .
+```
+
+Enable the experimental, observational consensus shadow validator with
+`--libbitcoinkernel`. It never changes btcd's block-acceptance decision; it
+replays the stored block tree into an independent kernel chainstate, submits
+new blocks to both implementations, and logs any disagreement.
+
+```sh
+./btcd --regtest --libbitcoinkernel --debuglevel=SRVR=debug
+```
+
+With debug logging enabled, successful comparisons are logged as
+`libbitcoinkernel agrees with btcd`. Investigate warnings containing
+`consensus divergence`, `tip differs`, or a missing connected/disconnected
+transition, as they indicate that the two implementations observed different
+consensus or chainstate results.
