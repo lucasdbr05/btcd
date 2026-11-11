@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/internal/bitcoinkernel"
 	"github.com/btcsuite/btcd/internal/inbound"
@@ -47,6 +48,78 @@ func TestKernelShadowValidatorDisabled(t *testing.T) {
 	// Keep the disabled configuration as a nil interface. A typed nil would
 	// make BlockChain attempt to invoke the validator in ordinary builds.
 	require.Nil(t, newKernelShadowValidator(nil))
+}
+
+func TestKernelShadowValidatorResultComparison(t *testing.T) {
+	t.Parallel()
+
+	validator := &kernelShadowValidator{}
+	tests := []struct {
+		name   string
+		btcd   blockchain.BlockValidationResult
+		kernel bitcoinkernel.BlockResult
+		want   bool
+	}{
+		{
+			name: "main chain acceptance",
+			btcd: blockchain.BlockValidationResult{
+				Outcome: blockchain.BlockAcceptedMainChain,
+			},
+			kernel: bitcoinkernel.BlockResult{
+				Checked: true,
+				Mode:    bitcoinkernel.ValidationValid,
+			},
+			want: true,
+		},
+		{
+			name: "orphan missing previous",
+			btcd: blockchain.BlockValidationResult{
+				Outcome: blockchain.BlockOrphaned,
+			},
+			kernel: bitcoinkernel.BlockResult{
+				Checked: true,
+				Mode:    bitcoinkernel.ValidationInvalid,
+				Reason:  bitcoinkernel.BlockResultMissingPrevious,
+			},
+			want: true,
+		},
+		{
+			name: "duplicate without callback",
+			btcd: blockchain.BlockValidationResult{
+				Outcome: blockchain.BlockDuplicate,
+			},
+			kernel: bitcoinkernel.BlockResult{},
+			want:   true,
+		},
+		{
+			name: "rejection",
+			btcd: blockchain.BlockValidationResult{
+				Outcome: blockchain.BlockRejected,
+			},
+			kernel: bitcoinkernel.BlockResult{
+				Checked: true,
+				Mode:    bitcoinkernel.ValidationInvalid,
+			},
+			want: true,
+		},
+		{
+			name: "btcd accepts kernel rejects",
+			btcd: blockchain.BlockValidationResult{
+				Outcome: blockchain.BlockAcceptedSideChain,
+			},
+			kernel: bitcoinkernel.BlockResult{
+				Checked: true,
+				Mode:    bitcoinkernel.ValidationInvalid,
+			},
+			want: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, validator.resultsAgree(test.btcd, test.kernel))
+		})
+	}
 }
 
 func TestKernelChain(t *testing.T) {

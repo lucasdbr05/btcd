@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/blockchain/internal/testhelper"
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 )
 
 type recordingBlockValidator struct {
@@ -18,6 +19,17 @@ type recordingBlockValidator struct {
 
 func (v *recordingBlockValidator) ValidateBlock(block *btcutil.Block) {
 	v.blocks = append(v.blocks, block)
+}
+
+type recordingBlockValidationObserver struct {
+	recordingBlockValidator
+	results []BlockValidationResult
+}
+
+func (v *recordingBlockValidationObserver) ObserveBlockValidationResult(
+	block *btcutil.Block, result BlockValidationResult,
+) {
+	v.results = append(v.results, result)
 }
 
 func TestProcessBlockNotifiesShadowValidator(t *testing.T) {
@@ -99,6 +111,72 @@ func TestProcessOrphansRevalidatesWithShadowValidator(t *testing.T) {
 		validator.blocks[1] != parent || validator.blocks[2] != child {
 
 		t.Fatalf("unexpected shadow validation order: %+v", validator.blocks)
+	}
+}
+
+func TestProcessBlockReportsFinalValidationResult(t *testing.T) {
+	chain, teardown, err := chainSetup("shadowvalidator-results",
+		&chaincfg.RegressionNetParams)
+	if err != nil {
+		t.Fatalf("unable to set up chain: %v", err)
+	}
+	defer teardown()
+
+	validator := &recordingBlockValidationObserver{}
+	chain.blockValidator = validator
+
+	genesis := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+	genesis.SetHeight(0)
+	parent, _, err := newBlock(chain, genesis, nil)
+	if err != nil {
+		t.Fatalf("unable to create parent block: %v", err)
+	}
+	child, _, err := newBlock(chain, parent, nil)
+	if err != nil {
+		t.Fatalf("unable to create child block: %v", err)
+	}
+
+	_, isOrphan, err := chain.ProcessBlock(child, BFNone)
+	if err != nil || !isOrphan {
+		t.Fatalf("unexpected orphan result: orphan=%v err=%v", isOrphan, err)
+	}
+	_, isOrphan, err = chain.ProcessBlock(parent, BFNone)
+	if err != nil || isOrphan {
+		t.Fatalf("unexpected parent result: orphan=%v err=%v", isOrphan, err)
+	}
+	_, _, err = chain.ProcessBlock(parent, BFNone)
+	if err == nil {
+		t.Fatal("expected duplicate-block error")
+	}
+
+	invalid := btcutil.NewBlock(&wire.MsgBlock{})
+	_, _, err = chain.ProcessBlock(invalid, BFNone)
+	if err == nil {
+		t.Fatal("expected invalid-block error")
+	}
+
+	if len(validator.results) != 5 {
+		t.Fatalf("unexpected result count: got %d, want 5", len(validator.results))
+	}
+	wantOutcomes := []BlockValidationOutcome{
+		BlockOrphaned,
+		BlockAcceptedMainChain,
+		BlockAcceptedMainChain,
+		BlockDuplicate,
+		BlockRejected,
+	}
+	for i, want := range wantOutcomes {
+		if got := validator.results[i].Outcome; got != want {
+			t.Errorf("result %d: got %s, want %s", i, got, want)
+		}
+	}
+	if got := validator.results[3].RuleError; got == nil ||
+		got.ErrorCode != ErrDuplicateBlock {
+
+		t.Errorf("duplicate result has unexpected rule error: %+v", got)
+	}
+	if validator.results[4].RuleError == nil {
+		t.Error("rejection result does not include its rule error")
 	}
 }
 

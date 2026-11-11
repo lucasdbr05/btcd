@@ -2234,6 +2234,57 @@ type BlockValidator interface {
 	ValidateBlock(block *btcutil.Block)
 }
 
+// BlockValidationOutcome describes btcd's final disposition of a submitted
+// block.
+type BlockValidationOutcome uint8
+
+// Possible block validation outcomes.
+const (
+	BlockAcceptedMainChain BlockValidationOutcome = iota
+	BlockAcceptedSideChain
+	BlockOrphaned
+	BlockDuplicate
+	BlockRejected
+	BlockProcessingError
+)
+
+// String returns a human-readable block validation outcome.
+func (o BlockValidationOutcome) String() string {
+	switch o {
+	case BlockAcceptedMainChain:
+		return "accepted-main-chain"
+	case BlockAcceptedSideChain:
+		return "accepted-side-chain"
+	case BlockOrphaned:
+		return "orphaned"
+	case BlockDuplicate:
+		return "duplicate"
+	case BlockRejected:
+		return "rejected"
+	case BlockProcessingError:
+		return "processing-error"
+	default:
+		return fmt.Sprintf("unknown-outcome-%d", o)
+	}
+}
+
+// BlockValidationResult is btcd's final result for a submitted block.  Rule
+// violations include the corresponding ErrorCode and description; operational
+// failures retain their original error.
+type BlockValidationResult struct {
+	Outcome      BlockValidationOutcome
+	RuleError    *RuleError
+	ProcessError error
+}
+
+// BlockValidationResultObserver can be optionally implemented by a
+// BlockValidator that needs btcd's final disposition after its own validation
+// has completed.  It is observational only and must not affect block
+// processing.
+type BlockValidationResultObserver interface {
+	ObserveBlockValidationResult(block *btcutil.Block, result BlockValidationResult)
+}
+
 // New returns a BlockChain instance using the provided configuration details.
 func New(config *Config) (*BlockChain, error) {
 	// Enforce required config fields.

@@ -24,16 +24,29 @@ type kernelShadowValidator struct {
 	mu                 sync.Mutex
 	pendingTransitions []bitcoinkernel.ChainEvent
 	nativeTip          *bitcoinkernel.ChainEvent
+	nativeResults      map[[32]byte]nativeBlockResult
 }
 
 var _ blockchain.BlockValidator = (*kernelShadowValidator)(nil)
+var _ blockchain.BlockValidationResultObserver = (*kernelShadowValidator)(nil)
+
+// nativeBlockResult is the result emitted by libbitcoinkernel for one
+// ProcessBlock submission.  The kernel callback uses a different result-code
+// space than btcd, so both values are preserved for diagnostics.
+type nativeBlockResult struct {
+	result bitcoinkernel.BlockResult
+	err    error
+}
 
 func newKernelShadowValidator(kernel *bitcoinkernel.Kernel) *kernelShadowValidator {
 	if kernel == nil {
 		return nil
 	}
 
-	return &kernelShadowValidator{kernel: kernel}
+	return &kernelShadowValidator{
+		kernel:        kernel,
+		nativeResults: make(map[[32]byte]nativeBlockResult),
+	}
 }
 
 func (v *kernelShadowValidator) ValidateBlock(block *btcutil.Block) {
@@ -46,6 +59,10 @@ func (v *kernelShadowValidator) ValidateBlock(block *btcutil.Block) {
 
 	result, err := v.kernel.ProcessBlock(rawBlock)
 	v.collectCallbacks()
+	v.storeNativeResult([32]byte(*block.Hash()), nativeBlockResult{
+		result: result,
+		err:    err,
+	})
 	if err != nil {
 		srvrLog.Errorf("libbitcoinkernel could not validate block %v: %v",
 			block.Hash(), err)
@@ -80,6 +97,92 @@ func (v *kernelShadowValidator) ValidateBlock(block *btcutil.Block) {
 		srvrLog.Errorf("libbitcoinkernel returned unknown validation mode for "+
 			"block %v: mode=%d reason=%d", block.Hash(), result.Mode,
 			result.Reason)
+	}
+}
+
+// ObserveBlockValidationResult compares btcd's final disposition for a block
+// with the corresponding libbitcoinkernel result.  It is called after btcd
+// has released the chain lock and never changes btcd's acceptance decision.
+func (v *kernelShadowValidator) ObserveBlockValidationResult(
+	block *btcutil.Block, btcdResult blockchain.BlockValidationResult,
+) {
+	v.collectCallbacks()
+
+	hash := [32]byte(*block.Hash())
+	native, ok := v.takeNativeResult(hash)
+	if !ok {
+		srvrLog.Debugf("libbitcoinkernel did not report a validation result for "+
+			"btcd's %s block %v", btcdResult.Outcome, block.Hash())
+		return
+	}
+	if native.err != nil {
+		srvrLog.Errorf("libbitcoinkernel could not compare btcd's %s block %v: %v",
+			btcdResult.Outcome, block.Hash(), native.err)
+		return
+	}
+
+	if v.resultsAgree(btcdResult, native.result) {
+		srvrLog.Debugf("libbitcoinkernel agrees with btcd for block %v: "+
+			"btcd=%s kernel-mode=%d kernel-reason=%d", block.Hash(),
+			btcdResult.Outcome, native.result.Mode, native.result.Reason)
+		return
+	}
+
+	btcdReason := ""
+	if btcdResult.RuleError != nil {
+		btcdReason = fmt.Sprintf(" code=%s reason=%q",
+			btcdResult.RuleError.ErrorCode, btcdResult.RuleError.Description)
+	} else if btcdResult.ProcessError != nil {
+		btcdReason = fmt.Sprintf(" error=%q", btcdResult.ProcessError)
+	}
+	srvrLog.Warnf("libbitcoinkernel consensus divergence for block %v: "+
+		"btcd=%s%s kernel-mode=%d kernel-reason=%d checked=%t new=%t",
+		block.Hash(), btcdResult.Outcome, btcdReason, native.result.Mode,
+		native.result.Reason, native.result.Checked, native.result.NewBlock)
+}
+
+func (v *kernelShadowValidator) storeNativeResult(hash [32]byte, result nativeBlockResult) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.nativeResults[hash] = result
+}
+
+func (v *kernelShadowValidator) takeNativeResult(hash [32]byte) (nativeBlockResult, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	result, ok := v.nativeResults[hash]
+	if ok {
+		delete(v.nativeResults, hash)
+	}
+	return result, ok
+}
+
+func (v *kernelShadowValidator) resultsAgree(btcdResult blockchain.BlockValidationResult,
+	nativeResult bitcoinkernel.BlockResult) bool {
+
+	switch btcdResult.Outcome {
+	case blockchain.BlockAcceptedMainChain, blockchain.BlockAcceptedSideChain:
+		return nativeResult.Checked && nativeResult.Mode == bitcoinkernel.ValidationValid
+
+	case blockchain.BlockOrphaned:
+		return nativeResult.Checked && nativeResult.Mode == bitcoinkernel.ValidationInvalid &&
+			nativeResult.Reason == bitcoinkernel.BlockResultMissingPrevious
+
+	case blockchain.BlockDuplicate:
+		// Neither implementation is required to emit a result for a block it
+		// already knows, so a missing block_checked callback is expected.
+		return !nativeResult.Checked
+
+	case blockchain.BlockRejected:
+		return nativeResult.Checked && nativeResult.Mode == bitcoinkernel.ValidationInvalid
+
+	case blockchain.BlockProcessingError:
+		return false
+
+	default:
+		return false
 	}
 }
 

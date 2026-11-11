@@ -81,7 +81,15 @@ func (b *BlockChain) blockExists(hash *chainhash.Hash) (bool, error) {
 // are needed to pass along to maybeAcceptBlock.
 //
 // This function MUST be called with the chain state lock held (for writes).
-func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) error {
+type blockValidationObservation struct {
+	block  *btcutil.Block
+	result BlockValidationResult
+}
+
+func (b *BlockChain) processOrphans(hash *chainhash.Hash,
+	flags BehaviorFlags) ([]blockValidationObservation, error) {
+	var observations []blockValidationObservation
+
 	// Start with processing at least the passed hash.  Leave a little room
 	// for additional orphan blocks that need to be processed without
 	// needing to grow the array in the common case.
@@ -123,9 +131,13 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 			}
 
 			// Potentially accept the block into the block chain.
-			_, err := b.maybeAcceptBlock(orphan.block, flags)
+			isMainChain, err := b.maybeAcceptBlock(orphan.block, flags)
+			observations = append(observations, blockValidationObservation{
+				block:  orphan.block,
+				result: blockValidationResult(isMainChain, false, err),
+			})
 			if err != nil {
-				return err
+				return observations, err
 			}
 
 			// Add this block to the list of blocks to process so
@@ -134,7 +146,7 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 			processHashes = append(processHashes, orphanHash)
 		}
 	}
-	return nil
+	return observations, nil
 }
 
 // ProcessBlock is the main workhorse for handling insertion of new blocks into
@@ -147,8 +159,16 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 // whether or not the block is an orphan.
 //
 // This function is safe for concurrent access.
-func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bool, bool, error) {
+func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (isMainChain bool, isOrphan bool, err error) {
 	b.chainLock.Lock()
+	var orphanObservations []blockValidationObservation
+	defer func() {
+		b.notifyBlockValidationResult(block,
+			blockValidationResult(isMainChain, isOrphan, err))
+		for _, observation := range orphanObservations {
+			b.notifyBlockValidationResult(observation.block, observation.result)
+		}
+	}()
 	defer b.chainLock.Unlock()
 
 	// An external validator is a shadow observer only.  In particular, a
@@ -240,7 +260,7 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 
 	// The block has passed all context independent checks and appears sane
 	// enough to potentially accept it into the block chain.
-	isMainChain, err := b.maybeAcceptBlock(block, flags)
+	isMainChain, err = b.maybeAcceptBlock(block, flags)
 	if err != nil {
 		return false, false, err
 	}
@@ -248,7 +268,7 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 	// Accept any orphan blocks that depend on this block (they are
 	// no longer orphans) and repeat for those accepted blocks until
 	// there are no more.
-	err = b.processOrphans(blockHash, flags)
+	orphanObservations, err = b.processOrphans(blockHash, flags)
 	if err != nil {
 		return false, false, err
 	}
@@ -256,6 +276,48 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 	log.Debugf("Accepted block %v", blockHash)
 
 	return isMainChain, false, nil
+}
+
+// notifyBlockValidationResult reports a ProcessBlock result to validators that
+// opted into final-result observation.  It runs after the chain lock has been
+// released so an observer cannot block chain processing or re-enter it while
+// locked.
+func (b *BlockChain) notifyBlockValidationResult(block *btcutil.Block,
+	result BlockValidationResult) {
+	observer, ok := b.blockValidator.(BlockValidationResultObserver)
+	if !ok {
+		return
+	}
+
+	observer.ObserveBlockValidationResult(block, result)
+}
+
+func blockValidationResult(isMainChain, isOrphan bool, err error) BlockValidationResult {
+	if err == nil {
+		switch {
+		case isOrphan:
+			return BlockValidationResult{Outcome: BlockOrphaned}
+		case isMainChain:
+			return BlockValidationResult{Outcome: BlockAcceptedMainChain}
+		default:
+			return BlockValidationResult{Outcome: BlockAcceptedSideChain}
+		}
+	}
+
+	if ruleErr, ok := err.(RuleError); ok {
+		result := BlockValidationResult{RuleError: &ruleErr}
+		if ruleErr.ErrorCode == ErrDuplicateBlock {
+			result.Outcome = BlockDuplicate
+		} else {
+			result.Outcome = BlockRejected
+		}
+		return result
+	}
+
+	return BlockValidationResult{
+		Outcome:      BlockProcessingError,
+		ProcessError: err,
+	}
 }
 
 // ProcessBlockHeader is the main workhorse for handling insertion of new block
