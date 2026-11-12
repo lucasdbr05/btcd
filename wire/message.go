@@ -175,6 +175,9 @@ func makeEmptyMessage(command string) (Message, error) {
 	case CmdSendAddrV2:
 		msg = &MsgSendAddrV2{}
 
+	case CmdWTxIdRelay:
+		msg = &MsgWTxIdRelay{}
+
 	case CmdGetAddr:
 		msg = &MsgGetAddr{}
 

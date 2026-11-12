@@ -58,6 +58,10 @@ const (
 	// new messages that occur during the version-verack handshake will not
 	// come with a protocol version bump.
 	AddrV2Version uint32 = 70016
+
+	// WTxIdRelayVersion is the protocol version which added the
+	// wtxidrelay message for BIP339 transaction relay negotiation.
+	WTxIdRelayVersion uint32 = AddrV2Version
 )
 
 const (

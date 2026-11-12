@@ -1185,12 +1185,14 @@ func TestSendAddrV2Handshake(t *testing.T) {
 	verackErr := errors.New("verack timeout")
 
 	tests := []struct {
-		name      string
-		expectsV2 bool
-		setup     func() (*peer.Peer, *peer.Peer, error)
+		name       string
+		expectsV2  bool
+		expectsWTx bool
+		setup      func() (*peer.Peer, *peer.Peer, error)
 	}{
 		{
 			"successful sendaddrv2 handshake",
+			true,
 			true,
 			func() (*peer.Peer, *peer.Peer, error) {
 				inPeer := peer.NewInboundPeer(peer1Cfg)
@@ -1221,8 +1223,9 @@ func TestSendAddrV2Handshake(t *testing.T) {
 		{
 			"handshake with legacy inbound peer",
 			false,
+			false,
 			func() (*peer.Peer, *peer.Peer, error) {
-				legacyVersion := wire.AddrV2Version - 1
+				legacyVersion := wire.WTxIdRelayVersion - 1
 				peer1Cfg.ProtocolVersion = legacyVersion
 				inPeer := peer.NewInboundPeer(peer1Cfg)
 				outPeer, err := peer.NewOutboundPeer(
@@ -1251,9 +1254,10 @@ func TestSendAddrV2Handshake(t *testing.T) {
 		{
 			"handshake with legacy outbound peer",
 			false,
+			false,
 			func() (*peer.Peer, *peer.Peer, error) {
 				inPeer := peer.NewInboundPeer(peer1Cfg)
-				legacyVersion := wire.AddrV2Version - 1
+				legacyVersion := wire.WTxIdRelayVersion - 1
 				peer2Cfg.ProtocolVersion = legacyVersion
 				outPeer, err := peer.NewOutboundPeer(
 					peer2Cfg, "10.0.0.2:8333",
@@ -1297,11 +1301,105 @@ func TestSendAddrV2Handshake(t *testing.T) {
 				"wantsAddrV2 to be %v instead was %v", i,
 				test.expectsV2, outPeer.WantsAddrV2())
 		}
+		if inPeer.WantsWTxIdRelay() != test.expectsWTx {
+			t.Fatalf("TestSendAddrV2Handshake #%d expected "+
+				"wantsWTxIdRelay to be %v instead was %v", i,
+				test.expectsWTx, inPeer.WantsWTxIdRelay())
+		} else if outPeer.WantsWTxIdRelay() != test.expectsWTx {
+			t.Fatalf("TestSendAddrV2Handshake #%d expected "+
+				"wantsWTxIdRelay to be %v instead was %v", i,
+				test.expectsWTx, outPeer.WantsWTxIdRelay())
+		}
 
 		inPeer.Disconnect()
 		outPeer.Disconnect()
 		inPeer.WaitForDisconnect()
 		outPeer.WaitForDisconnect()
+	}
+}
+
+// TestWTxIdRelayHandshake verifies the message order and state transitions
+// required by BIP339 during the version handshake.
+func TestWTxIdRelayHandshake(t *testing.T) {
+	verack := make(chan struct{}, 1)
+	peerCfg := &peer.Config{
+		Listeners: peer.MessageListeners{
+			OnVerAck: func(*peer.Peer, *wire.MsgVerAck) {
+				verack <- struct{}{}
+			},
+		},
+		AllowSelfConns: true,
+		ChainParams:    &chaincfg.MainNetParams,
+	}
+
+	localConn, remoteConn := pipe(
+		&conn{laddr: "10.0.0.1:8333", raddr: "10.0.0.2:8333"},
+		&conn{laddr: "10.0.0.2:8333", raddr: "10.0.0.1:8333"},
+	)
+
+	p, err := peer.NewOutboundPeer(peerCfg, "10.0.0.2:8333")
+	if err != nil {
+		t.Fatalf("NewOutboundPeer: unexpected error: %v", err)
+	}
+	t.Cleanup(func() {
+		p.Disconnect()
+		p.WaitForDisconnect()
+	})
+	p.AssociateConnection(localConn)
+
+	readMessage := func(want string) {
+		t.Helper()
+		_, got, _, err := wire.ReadMessageN(
+			remoteConn, wire.ProtocolVersion, peerCfg.ChainParams.Net,
+		)
+		if err != nil {
+			t.Fatalf("ReadMessageN: unexpected error: %v", err)
+		}
+		if got.Command() != want {
+			t.Fatalf("unexpected message: got %s, want %s",
+				got.Command(), want)
+		}
+	}
+	writeMessage := func(msg wire.Message) {
+		t.Helper()
+		if err := wire.WriteMessage(
+			remoteConn.Writer, msg, wire.ProtocolVersion,
+			peerCfg.ChainParams.Net,
+		); err != nil {
+			t.Fatalf("WriteMessage: unexpected error: %v", err)
+		}
+	}
+
+	readMessage(wire.CmdVersion)
+	remoteNA := wire.NewNetAddressIPPort(
+		net.ParseIP("10.0.0.2"), 8333, wire.SFNodeNetwork,
+	)
+	localNA := wire.NewNetAddressIPPort(
+		net.ParseIP("10.0.0.1"), 8333, wire.SFNodeNetwork,
+	)
+	writeMessage(wire.NewMsgVersion(remoteNA, localNA, 0, 0))
+	readMessage(wire.CmdWTxIdRelay)
+	readMessage(wire.CmdSendAddrV2)
+	readMessage(wire.CmdVerAck)
+
+	writeMessage(wire.NewMsgWTxIdRelay())
+	writeMessage(wire.NewMsgSendAddrV2())
+	writeMessage(wire.NewMsgVerAck())
+
+	select {
+	case <-verack:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for verack")
+	}
+	if !p.WantsWTxIdRelay() {
+		t.Fatal("peer did not negotiate wtxid relay")
+	}
+
+	writeMessage(wire.NewMsgWTxIdRelay())
+	select {
+	case <-p.Done():
+	case <-time.After(time.Second):
+		t.Fatal("peer did not disconnect after late wtxidrelay")
 	}
 }
 

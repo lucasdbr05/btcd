@@ -473,6 +473,7 @@ type Peer struct {
 	verAckReceived       bool
 	witnessEnabled       bool
 	sendAddrV2           bool
+	wtxidRelay           bool
 
 	V2Transport *v2transport.Peer
 
@@ -849,6 +850,18 @@ func (p *Peer) WantsAddrV2() bool {
 	p.flagsMtx.Unlock()
 
 	return wantsAddrV2
+}
+
+// WantsWTxIdRelay returns whether the peer prefers transaction relay by
+// witness transaction id.
+//
+// This function is safe for concurrent access.
+func (p *Peer) WantsWTxIdRelay() bool {
+	p.flagsMtx.Lock()
+	wantsWTxIdRelay := p.wtxidRelay
+	p.flagsMtx.Unlock()
+
+	return wantsWTxIdRelay
 }
 
 // PushAddrMsg sends an addr message to the connected peer using the provided
@@ -1530,6 +1543,11 @@ out:
 			break out
 
 		case *wire.MsgSendAddrV2:
+			// Disconnect if peer sends this after the handshake is
+			// completed.
+			break out
+
+		case *wire.MsgWTxIdRelay:
 			// Disconnect if peer sends this after the handshake is
 			// completed.
 			break out
@@ -2221,12 +2239,22 @@ func (p *Peer) writeLocalVersionMsg() error {
 // writeSendAddrV2Msg writes our sendaddrv2 message to the remote peer if the
 // peer supports protocol version 70016 and above.
 func (p *Peer) writeSendAddrV2Msg(pver uint32) error {
-	if pver < wire.AddrV2Version {
+	if pver < wire.WTxIdRelayVersion {
 		return nil
 	}
 
 	sendAddrMsg := wire.NewMsgSendAddrV2()
 	return p.writeMessage(sendAddrMsg, wire.LatestEncoding)
+}
+
+// writeWTxIdRelayMsg writes our wtxidrelay message to the remote peer if the
+// peer supports protocol version 70016 and above.
+func (p *Peer) writeWTxIdRelayMsg(pver uint32) error {
+	if pver < wire.AddrV2Version {
+		return nil
+	}
+
+	return p.writeMessage(wire.NewMsgWTxIdRelay(), wire.LatestEncoding)
 }
 
 // waitToFinishNegotiation waits until desired negotiation messages are
@@ -2236,9 +2264,9 @@ func (p *Peer) writeSendAddrV2Msg(pver uint32) error {
 func (p *Peer) waitToFinishNegotiation(pver uint32) error {
 	// There are several possible messages that can be received here. We
 	// could immediately receive verack and be done with the handshake. We
-	// could receive sendaddrv2 and still have to wait for verack. Or we
-	// can receive unknown messages before and after sendaddrv2 and still
-	// have to wait for verack.
+	// could receive one or more negotiable messages and still have to wait
+	// for verack. Or we can receive unknown messages before and after those
+	// messages and still have to wait for verack.
 	for {
 		remoteMsg, _, err := p.readMessage(wire.LatestEncoding, false)
 		if err == wire.ErrUnknownMessage {
@@ -2248,6 +2276,12 @@ func (p *Peer) waitToFinishNegotiation(pver uint32) error {
 		}
 
 		switch m := remoteMsg.(type) {
+		case *wire.MsgWTxIdRelay:
+			if pver >= wire.WTxIdRelayVersion {
+				p.flagsMtx.Lock()
+				p.wtxidRelay = true
+				p.flagsMtx.Unlock()
+			}
 		case *wire.MsgSendAddrV2:
 			if pver >= wire.AddrV2Version {
 				p.flagsMtx.Lock()
@@ -2277,12 +2311,11 @@ func (p *Peer) waitToFinishNegotiation(pver uint32) error {
 //
 //  1. Remote peer sends their version.
 //  2. We send our version.
-//  3. We send sendaddrv2 if their version is >= 70016.
+//  3. We send wtxidrelay and sendaddrv2 if their version is >= 70016.
 //  4. We send our verack.
-//  5. Wait until sendaddrv2 or verack is received. Unknown messages are
-//     skipped as it could be wtxidrelay or a different message in the future
-//     that btcd does not implement but bitcoind does.
-//  6. If remote peer sent sendaddrv2 above, wait until receipt of verack.
+//  5. Wait until negotiation messages or verack is received. Unknown messages
+//     are skipped as they could be a message in the future that btcd does not
+//     implement but bitcoind does.
 func (p *Peer) negotiateInboundProtocol() error {
 	// We may be anticipating a v2 connection, but if the initiating peer
 	// sends us a v1 version message, we need to note down that we've
@@ -2334,6 +2367,10 @@ func (p *Peer) negotiateInboundProtocol() error {
 	protoVersion = p.protocolVersion
 	p.flagsMtx.Unlock()
 
+	if err := p.writeWTxIdRelayMsg(protoVersion); err != nil {
+		return err
+	}
+
 	if err := p.writeSendAddrV2Msg(protoVersion); err != nil {
 		return err
 	}
@@ -2353,11 +2390,10 @@ func (p *Peer) negotiateInboundProtocol() error {
 //
 //  1. We send our version.
 //  2. Remote peer sends their version.
-//  3. We send sendaddrv2 if their version is >= 70016.
+//  3. We send wtxidrelay and sendaddrv2 if their version is >= 70016.
 //  4. We send our verack.
-//  5. We wait to receive sendaddrv2 or verack, skipping unknown messages as
-//     in the inbound case.
-//  6. If sendaddrv2 was received, wait for receipt of verack.
+//  5. We wait to receive negotiation messages or verack, skipping unknown
+//     messages as in the inbound case.
 func (p *Peer) negotiateOutboundProtocol() error {
 	if p.cfg.UsingV2Conn {
 		// Note that it's possible that the v2 handshake fails because
@@ -2396,6 +2432,10 @@ func (p *Peer) negotiateOutboundProtocol() error {
 	p.flagsMtx.Lock()
 	protoVersion = p.protocolVersion
 	p.flagsMtx.Unlock()
+
+	if err := p.writeWTxIdRelayMsg(protoVersion); err != nil {
+		return err
+	}
 
 	if err := p.writeSendAddrV2Msg(protoVersion); err != nil {
 		return err
