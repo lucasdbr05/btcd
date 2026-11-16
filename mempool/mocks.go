@@ -62,10 +62,34 @@ func (m *MockTxMempool) FetchTransaction(
 	return args.Get(0).(*btcutil.Tx), args.Error(1)
 }
 
+// FetchTransactionByWitnessHash returns the requested transaction from the
+// transaction pool by wtxid. This only fetches from the main transaction pool
+// and does not include orphans.
+func (m *MockTxMempool) FetchTransactionByWitnessHash(
+	witnessHash *chainhash.Hash) (*btcutil.Tx, error) {
+
+	args := m.Called(witnessHash)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*btcutil.Tx), args.Error(1)
+}
+
 // HaveTransaction returns whether or not the passed transaction already exists
 // in the main pool or in the orphan pool.
 func (m *MockTxMempool) HaveTransaction(hash *chainhash.Hash) bool {
 	args := m.Called(hash)
+	return args.Get(0).(bool)
+}
+
+// HaveTransactionByWitnessHash returns whether or not the passed wtxid
+// already exists in the main pool or in the orphan pool.
+func (m *MockTxMempool) HaveTransactionByWitnessHash(
+	witnessHash *chainhash.Hash) bool {
+
+	args := m.Called(witnessHash)
 	return args.Get(0).(bool)
 }
 

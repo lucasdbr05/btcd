@@ -451,6 +451,68 @@ func testPoolMembership(tc *testContext, tx *btcutil.Tx, inOrphanPool, inTxPool 
 	}
 }
 
+// TestWitnessHashIndex ensures that transactions can be located by wtxid in
+// both the main and orphan pools, and that the indexes are removed with their
+// respective transactions.
+func TestWitnessHashIndex(t *testing.T) {
+	t.Parallel()
+
+	harness, _, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+
+	msgTx := wire.NewMsgTx(wire.TxVersion)
+	msgTx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Index: 1},
+		Witness:          wire.TxWitness{[]byte{0x01}},
+	})
+	msgTx.AddTxOut(&wire.TxOut{Value: 1})
+	tx := btcutil.NewTx(msgTx)
+	witnessHash := tx.WitnessHash()
+	if tx.Hash().IsEqual(witnessHash) {
+		t.Fatal("witness transaction has identical txid and wtxid")
+	}
+
+	harness.txPool.addTransaction(
+		blockchain.NewUtxoViewpoint(), tx, 0, 0,
+	)
+	if !harness.txPool.HaveTransactionByWitnessHash(witnessHash) {
+		t.Fatal("main-pool transaction not found by wtxid")
+	}
+	if harness.txPool.HaveTransaction(witnessHash) {
+		t.Fatal("wtxid unexpectedly found as a txid")
+	}
+	fetched, err := harness.txPool.FetchTransactionByWitnessHash(witnessHash)
+	if err != nil {
+		t.Fatalf("unable to fetch transaction by wtxid: %v", err)
+	}
+	if fetched != tx {
+		t.Fatal("wrong transaction fetched by wtxid")
+	}
+
+	harness.txPool.removeTransaction(tx, false)
+	if harness.txPool.HaveTransactionByWitnessHash(witnessHash) {
+		t.Fatal("removed main-pool transaction still found by wtxid")
+	}
+	if _, err := harness.txPool.FetchTransactionByWitnessHash(witnessHash); err == nil {
+		t.Fatal("removed main-pool transaction fetched by wtxid")
+	}
+
+	harness.txPool.addOrphan(tx, 0)
+	if !harness.txPool.HaveTransactionByWitnessHash(witnessHash) {
+		t.Fatal("orphan transaction not found by wtxid")
+	}
+	if _, err := harness.txPool.FetchTransactionByWitnessHash(witnessHash); err == nil {
+		t.Fatal("orphan transaction fetched by wtxid")
+	}
+
+	harness.txPool.removeOrphan(tx, false)
+	if harness.txPool.HaveTransactionByWitnessHash(witnessHash) {
+		t.Fatal("removed orphan transaction still found by wtxid")
+	}
+}
+
 // TestSimpleOrphanChain ensures that a simple chain of orphans is handled
 // properly.  In particular, it generates a chain of single input, single output
 // transactions and inserts them while skipping the first linking transaction so

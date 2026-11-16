@@ -33,9 +33,18 @@ type TxMempool interface {
 	// and does not include orphans.
 	FetchTransaction(txHash *chainhash.Hash) (*btcutil.Tx, error)
 
+	// FetchTransactionByWitnessHash returns the requested transaction from the
+	// transaction pool by wtxid. This only fetches from the main transaction
+	// pool and does not include orphans.
+	FetchTransactionByWitnessHash(witnessHash *chainhash.Hash) (*btcutil.Tx, error)
+
 	// HaveTransaction returns whether or not the passed transaction
 	// already exists in the main pool or in the orphan pool.
 	HaveTransaction(hash *chainhash.Hash) bool
+
+	// HaveTransactionByWitnessHash returns whether or not the passed wtxid
+	// already exists in the main pool or in the orphan pool.
+	HaveTransactionByWitnessHash(witnessHash *chainhash.Hash) bool
 
 	// ProcessTransaction is the main workhorse for handling insertion of
 	// new free-standing transactions into the memory pool. It includes

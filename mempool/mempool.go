@@ -182,14 +182,16 @@ type TxPool struct {
 	// The following variables must only be used atomically.
 	lastUpdated int64 // last time pool was updated
 
-	mtx           sync.RWMutex
-	cfg           Config
-	pool          map[chainhash.Hash]*TxDesc
-	orphans       map[chainhash.Hash]*orphanTx
-	orphansByPrev map[wire.OutPoint]map[chainhash.Hash]*btcutil.Tx
-	outpoints     map[wire.OutPoint]*btcutil.Tx
-	pennyTotal    float64 // exponentially decaying total for penny spends.
-	lastPennyUnix int64   // unix time of last ``penny spend''
+	mtx                  sync.RWMutex
+	cfg                  Config
+	pool                 map[chainhash.Hash]*TxDesc
+	poolByWitnessHash    map[chainhash.Hash]*TxDesc
+	orphans              map[chainhash.Hash]*orphanTx
+	orphansByWitnessHash map[chainhash.Hash]*orphanTx
+	orphansByPrev        map[wire.OutPoint]map[chainhash.Hash]*btcutil.Tx
+	outpoints            map[wire.OutPoint]*btcutil.Tx
+	pennyTotal           float64 // exponentially decaying total for penny spends.
+	lastPennyUnix        int64   // unix time of last ``penny spend''
 
 	// nextExpireScan is the time after which the orphan pool will be
 	// scanned in order to evict orphans.  This is NOT a hard deadline as
@@ -243,6 +245,7 @@ func (mp *TxPool) removeOrphan(tx *btcutil.Tx, removeRedeemers bool) {
 
 	// Remove the transaction from the orphan pool.
 	delete(mp.orphans, *txHash)
+	delete(mp.orphansByWitnessHash, *otx.tx.WitnessHash())
 }
 
 // RemoveOrphan removes the passed orphan transaction from the orphan pool and
@@ -339,11 +342,13 @@ func (mp *TxPool) addOrphan(tx *btcutil.Tx, tag Tag) {
 	// orphan if space is still needed.
 	mp.limitNumOrphans()
 
-	mp.orphans[*tx.Hash()] = &orphanTx{
+	orphan := &orphanTx{
 		tx:         tx,
 		tag:        tag,
 		expiration: time.Now().Add(orphanTTL),
 	}
+	mp.orphans[*tx.Hash()] = orphan
+	mp.orphansByWitnessHash[*tx.WitnessHash()] = orphan
 	for _, txIn := range tx.MsgTx().TxIn {
 		if _, exists := mp.orphansByPrev[txIn.PreviousOutPoint]; !exists {
 			mp.orphansByPrev[txIn.PreviousOutPoint] =
@@ -471,6 +476,21 @@ func (mp *TxPool) HaveTransaction(hash *chainhash.Hash) bool {
 	return haveTx
 }
 
+// HaveTransactionByWitnessHash returns whether or not the passed wtxid
+// already exists in the main pool or in the orphan pool.
+//
+// This function is safe for concurrent access.
+func (mp *TxPool) HaveTransactionByWitnessHash(
+	witnessHash *chainhash.Hash) bool {
+
+	mp.mtx.RLock()
+	_, inPool := mp.poolByWitnessHash[*witnessHash]
+	_, inOrphanPool := mp.orphansByWitnessHash[*witnessHash]
+	mp.mtx.RUnlock()
+
+	return inPool || inOrphanPool
+}
+
 // removeTransaction is the internal function which implements the public
 // RemoveTransaction.  See the comment for RemoveTransaction for more details.
 //
@@ -500,6 +520,7 @@ func (mp *TxPool) removeTransaction(tx *btcutil.Tx, removeRedeemers bool) {
 			delete(mp.outpoints, txIn.PreviousOutPoint)
 		}
 		delete(mp.pool, *txHash)
+		delete(mp.poolByWitnessHash, *txDesc.Tx.WitnessHash())
 		atomic.StoreInt64(&mp.lastUpdated, time.Now().Unix())
 	}
 }
@@ -557,6 +578,7 @@ func (mp *TxPool) addTransaction(utxoView *blockchain.UtxoViewpoint, tx *btcutil
 	}
 
 	mp.pool[*tx.Hash()] = txD
+	mp.poolByWitnessHash[*tx.WitnessHash()] = txD
 	for _, txIn := range tx.MsgTx().TxIn {
 		mp.outpoints[txIn.PreviousOutPoint] = tx
 	}
@@ -822,6 +844,25 @@ func (mp *TxPool) FetchTransaction(txHash *chainhash.Hash) (*btcutil.Tx, error) 
 	// Protect concurrent access.
 	mp.mtx.RLock()
 	txDesc, exists := mp.pool[*txHash]
+	mp.mtx.RUnlock()
+
+	if exists {
+		return txDesc.Tx, nil
+	}
+
+	return nil, fmt.Errorf("transaction is not in the pool")
+}
+
+// FetchTransactionByWitnessHash returns the requested transaction from the
+// transaction pool by wtxid. This only fetches from the main transaction pool
+// and does not include orphans.
+//
+// This function is safe for concurrent access.
+func (mp *TxPool) FetchTransactionByWitnessHash(
+	witnessHash *chainhash.Hash) (*btcutil.Tx, error) {
+
+	mp.mtx.RLock()
+	txDesc, exists := mp.poolByWitnessHash[*witnessHash]
 	mp.mtx.RUnlock()
 
 	if exists {
@@ -1759,11 +1800,13 @@ func (mp *TxPool) validateRelayFeeMet(tx *btcutil.Tx, txFee, txSize int64,
 // transactions until they are mined into a block.
 func New(cfg *Config) *TxPool {
 	return &TxPool{
-		cfg:            *cfg,
-		pool:           make(map[chainhash.Hash]*TxDesc),
-		orphans:        make(map[chainhash.Hash]*orphanTx),
-		orphansByPrev:  make(map[wire.OutPoint]map[chainhash.Hash]*btcutil.Tx),
-		nextExpireScan: time.Now().Add(orphanExpireScanInterval),
-		outpoints:      make(map[wire.OutPoint]*btcutil.Tx),
+		cfg:                  *cfg,
+		pool:                 make(map[chainhash.Hash]*TxDesc),
+		poolByWitnessHash:    make(map[chainhash.Hash]*TxDesc),
+		orphans:              make(map[chainhash.Hash]*orphanTx),
+		orphansByWitnessHash: make(map[chainhash.Hash]*orphanTx),
+		orphansByPrev:        make(map[wire.OutPoint]map[chainhash.Hash]*btcutil.Tx),
+		nextExpireScan:       time.Now().Add(orphanExpireScanInterval),
+		outpoints:            make(map[wire.OutPoint]*btcutil.Tx),
 	}
 }
